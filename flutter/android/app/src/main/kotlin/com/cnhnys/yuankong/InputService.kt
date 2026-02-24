@@ -1,4 +1,4 @@
-package com.carriez.flutter_hbb
+package com.cnhnys.yuankong
 
 /**
  * Handle remote input and dispatch android gesture
