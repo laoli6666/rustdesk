@@ -32,7 +32,6 @@ import android.util.Log
 import android.view.Surface
 import android.view.Surface.FRAME_RATE_COMPATIBILITY_DEFAULT
 import android.view.WindowManager
-import android.view.KeyEvent // 修正：添加 KeyEvent 导入
 import androidx.annotation.Keep
 import androidx.annotation.RequiresApi
 import androidx.core.app.ActivityCompat
@@ -46,12 +45,6 @@ import org.json.JSONObject
 import java.nio.ByteBuffer
 import kotlin.math.max
 import kotlin.math.min
-// ==================== 新增导入 ====================
-import java.io.*
-import android.net.LocalServerSocket  // 修正：使用 android.net 包
-import android.net.LocalSocket        // 修正：使用 android.net 包
-import java.util.*
-// =================================================
 
 const val DEFAULT_NOTIFY_TITLE = "CloudBox"
 const val DEFAULT_NOTIFY_TEXT = "Service is running"
@@ -67,11 +60,6 @@ const val MAX_SCREEN_SIZE = 1200
 const val VIDEO_KEY_BIT_RATE = 1024_000
 const val VIDEO_KEY_FRAME_RATE = 30
 
-// ==================== ADB 命令相关常量 ====================
-private const val LONG_PRESS_DURATION = 500L // 长按模拟时长（毫秒）
-private const val SWIPE_DURATION = 10L       // 滑动模拟默认时长
-// =========================================================
-
 class MainService : Service() {
 
     @Keep
@@ -86,12 +74,6 @@ class MainService : Service() {
             Log.d(logTag,"Turn on Screen")
             wakeLock.acquire(5000)
         } else {
-            // ==================== 降级处理：当无障碍服务不可用时使用 LocalSocket ====================
-            if (InputService.ctx == null) {
-                handlePointerInputViaSocket(kind, mask, x, y)
-                return
-            }
-            // ===============================================================================
             when (kind) {
                 0 -> { // touch
                     InputService.ctx?.onTouchInput(mask, x, y)
@@ -108,12 +90,6 @@ class MainService : Service() {
     @Keep
     @RequiresApi(Build.VERSION_CODES.N)
     fun rustKeyEventInput(input: ByteArray) {
-        // ==================== 降级处理：当无障碍服务不可用时使用 LocalSocket ====================
-        if (InputService.ctx == null) {
-            handleKeyEventViaSocket(input)
-            return
-        }
-        // ===============================================================================
         InputService.ctx?.onKeyEvent(input)
     }
 
@@ -218,28 +194,6 @@ class MainService : Service() {
     private val powerManager: PowerManager by lazy { applicationContext.getSystemService(Context.POWER_SERVICE) as PowerManager }
     private val wakeLock: PowerManager.WakeLock by lazy { powerManager.newWakeLock(PowerManager.ACQUIRE_CAUSES_WAKEUP or PowerManager.SCREEN_BRIGHT_WAKE_LOCK, "rustdesk:wakelock")}
 
-    // ==================== LocalSocket 相关成员 ====================
-    private var localServerSocket: LocalServerSocket? = null
-    private var clientSocket: LocalSocket? = null
-    private var outputStream: OutputStream? = null
-    private val socketLock = Any()
-
-    // 用于降级时模拟鼠标/触摸的状态跟踪
-    private var lastX = 0
-    private var lastY = 0
-    private var isLeftDown = false
-    private var startX = 0
-    private var startY = 0
-    private var isTouchActive = false
-    private var touchStartX = 0
-    private var touchStartY = 0
-
-    // 用于处理鼠标中键长按模拟最近任务
-    private var wheelButtonDownTime = 0L
-    private val wheelButtonTimer = Timer()
-    private var wheelButtonTask: TimerTask? = null
-    // =============================================================
-
     companion object {
         private var _isReady = false // media permission ready status
         private var _isStart = false // screen capture start status
@@ -292,20 +246,9 @@ class MainService : Service() {
         FFI.startServer(configPath, "")
 
         createForegroundNotification()
-        // ==================== 启动 LocalSocket 服务器 ====================
-        startLocalSocketServer()
-        // ==============================================================
     }
 
     override fun onDestroy() {
-        // ==================== 关闭 LocalSocket ====================
-        closeClientSocket()
-        try {
-            localServerSocket?.close()
-        } catch (e: IOException) {
-            Log.e(logTag, "Error closing local server socket", e)
-        }
-        // ==========================================================
         checkMediaPermission()
         stopService(Intent(this, FloatingWindowService::class.java))
         super.onDestroy()
@@ -783,252 +726,4 @@ class MainService : Service() {
             .build()
         notificationManager.notify(DEFAULT_NOTIFY_ID, notification)
     }
-
-    // ==================== LocalSocket 服务器实现 ====================
-    private fun startLocalSocketServer() {
-        thread {
-            try {
-                localServerSocket = LocalServerSocket("MyInput")
-                Log.d(logTag, "LocalSocket server started on MyInput")
-                while (true) {
-                    val socket = localServerSocket?.accept()
-                    if (socket != null) {
-                        synchronized(socketLock) {
-                            closeClientSocket()
-                            clientSocket = socket
-                            outputStream = socket.outputStream
-                            Log.d(logTag, "LocalSocket client connected")
-                        }
-                    }
-                }
-            } catch (e: IOException) {
-                Log.e(logTag, "LocalSocket server error", e)
-            }
-        }
-    }
-
-    private fun closeClientSocket() {
-        try {
-            outputStream?.close()
-            clientSocket?.close()
-        } catch (e: IOException) {
-            // ignore
-        }
-        outputStream = null
-        clientSocket = null
-    }
-
-    private fun sendAdbCommand(command: String) {
-        if (command.isEmpty()) return
-        synchronized(socketLock) {
-            outputStream?.let {
-                try {
-                    val data = "$command\n".toByteArray(Charsets.UTF_8)
-                    it.write(data)
-                    it.flush()
-                    Log.d(logTag, "Sent ADB command: $command")
-                } catch (e: IOException) {
-                    Log.e(logTag, "Failed to send ADB command", e)
-                    closeClientSocket()
-                }
-            } ?: run {
-                Log.d(logTag, "No client connected, dropping command: $command")
-            }
-        }
-    }
-    // ===============================================================
-
-    // ==================== 降级输入处理（通过 LocalSocket） ====================
-    @RequiresApi(Build.VERSION_CODES.N)
-    private fun handlePointerInputViaSocket(kind: Int, mask: Int, x: Int, y: Int) {
-        val scaledX = x * SCREEN_INFO.scale
-        val scaledY = y * SCREEN_INFO.scale
-        when (kind) {
-            0 -> handleTouchInputViaSocket(mask, scaledX, scaledY)
-            1 -> handleMouseInputViaSocket(mask, scaledX, scaledY)
-        }
-    }
-
-    @RequiresApi(Build.VERSION_CODES.N)
-    private fun handleTouchInputViaSocket(mask: Int, x: Int, y: Int) {
-        when (mask) {
-            TOUCH_PAN_START -> {
-                isTouchActive = true
-                touchStartX = x
-                touchStartY = y
-                // 不发送命令，等待结束
-            }
-            TOUCH_PAN_UPDATE -> {
-                // 只更新坐标，仍然不发送
-                // 可以在更新时记录最后位置，但这里暂不处理
-            }
-            TOUCH_PAN_END -> {
-                if (isTouchActive) {
-                    if (touchStartX == x && touchStartY == y) {
-                        // 没有移动，发送 tap
-                        sendAdbCommand("tap $x $y")
-                    } else {
-                        // 有移动，发送 swipe
-                        sendAdbCommand("swipe $touchStartX $touchStartY $x $y $SWIPE_DURATION")
-                    }
-                    isTouchActive = false
-                }
-            }
-        }
-    }
-
-    @RequiresApi(Build.VERSION_CODES.N)
-    private fun handleMouseInputViaSocket(mask: Int, x: Int, y: Int) {
-        when (mask) {
-            LEFT_DOWN -> {
-                isLeftDown = true
-                startX = x
-                startY = y
-                lastX = x
-                lastY = y
-                // 不立即发送
-            }
-            LEFT_MOVE -> {
-                if (isLeftDown) {
-                    lastX = x
-                    lastY = y
-                }
-            }
-            LEFT_UP -> {
-                if (isLeftDown) {
-                    if (startX == x && startY == y) {
-                        sendAdbCommand("tap $x $y")
-                    } else {
-                        sendAdbCommand("swipe $startX $startY $x $y $SWIPE_DURATION")
-                    }
-                    isLeftDown = false
-                }
-            }
-            RIGHT_UP -> {
-                // 模拟长按
-                sendAdbCommand("swipe $x $y $x $y $LONG_PRESS_DURATION")
-            }
-            BACK_UP -> {
-                sendAdbCommand("keyevent KEYCODE_BACK")
-            }
-            WHEEL_BUTTON_DOWN -> {
-                // 记录按下时间，准备处理长按
-                wheelButtonDownTime = System.currentTimeMillis()
-                wheelButtonTask?.cancel()
-                wheelButtonTask = object : TimerTask() {
-                    override fun run() {
-                        // 长按触发最近任务
-                        sendAdbCommand("keyevent KEYCODE_APP_SWITCH")
-                        wheelButtonTask = null
-                    }
-                }
-                wheelButtonTimer.schedule(wheelButtonTask, LONG_TAP_DELAY)
-            }
-            WHEEL_BUTTON_UP -> {
-                wheelButtonTask?.let {
-                    it.cancel()
-                    wheelButtonTask = null
-                    // 短按触发 HOME
-                    sendAdbCommand("keyevent KEYCODE_HOME")
-                } ?: run {
-                    // 如果任务已被执行（长按已触发），则不再发送 HOME
-                }
-            }
-            WHEEL_DOWN -> {
-                // 模拟向下滚动（用 DPAD_DOWN）
-                sendAdbCommand("keyevent KEYCODE_DPAD_DOWN")
-            }
-            WHEEL_UP -> {
-                // 模拟向上滚动
-                sendAdbCommand("keyevent KEYCODE_DPAD_UP")
-            }
-        }
-    }
-
-    @RequiresApi(Build.VERSION_CODES.N)
-    private fun handleKeyEventViaSocket(data: ByteArray) {
-        val keyEvent = hbb.MessageOuterClass.KeyEvent.parseFrom(data)
-        val keyboardMode = keyEvent.getMode()
-
-        var textToCommit: String? = null
-        if (keyEvent.hasSeq()) {
-            textToCommit = keyEvent.getSeq()
-        } else if (keyboardMode == hbb.MessageOuterClass.KeyboardMode.Legacy) {
-            if (keyEvent.hasChr() && (keyEvent.getDown() || keyEvent.getPress())) {
-                val chr = keyEvent.getChr()
-                if (chr != null) {
-                    textToCommit = String(Character.toChars(chr))
-                }
-            }
-        }
-
-        if (textToCommit != null) {
-            // 发送文本命令，注意转义
-            val escapedText = textToCommit.replace("\"", "\\\"")
-            sendAdbCommand("text \"$escapedText\"")
-        } else {
-            // 转换为 Android KeyEvent 再提取 keycode
-            val ke = hbb.KeyEventConverter.toAndroidKeyEvent(keyEvent)
-            ke?.let { event ->
-                // 处理音量键（避免重复处理）
-                if (tryHandleVolumeKeyEventViaSocket(event)) {
-                    return
-                }
-                // 处理电源键
-                if (tryHandlePowerKeyEventViaSocket(event)) {
-                    return
-                }
-                val keyCode = when (event.keyCode) {
-                    KeyEvent.KEYCODE_DEL -> "KEYCODE_DEL"
-                    KeyEvent.KEYCODE_ENTER -> "KEYCODE_ENTER"
-                    KeyEvent.KEYCODE_HOME -> "KEYCODE_HOME"
-                    KeyEvent.KEYCODE_BACK -> "KEYCODE_BACK"
-                    KeyEvent.KEYCODE_MENU -> "KEYCODE_MENU"
-                    KeyEvent.KEYCODE_VOLUME_UP -> "KEYCODE_VOLUME_UP"
-                    KeyEvent.KEYCODE_VOLUME_DOWN -> "KEYCODE_VOLUME_DOWN"
-                    KeyEvent.KEYCODE_VOLUME_MUTE -> "KEYCODE_VOLUME_MUTE"
-                    KeyEvent.KEYCODE_POWER -> "KEYCODE_POWER"
-                    KeyEvent.KEYCODE_DPAD_UP -> "KEYCODE_DPAD_UP"
-                    KeyEvent.KEYCODE_DPAD_DOWN -> "KEYCODE_DPAD_DOWN"
-                    KeyEvent.KEYCODE_DPAD_LEFT -> "KEYCODE_DPAD_LEFT"
-                    KeyEvent.KEYCODE_DPAD_RIGHT -> "KEYCODE_DPAD_RIGHT"
-                    KeyEvent.KEYCODE_DPAD_CENTER -> "KEYCODE_DPAD_CENTER"
-                    else -> {
-                        // 对于其他按键，尝试获取名称
-                        KeyEvent.keyCodeToString(event.keyCode).removePrefix("KEYCODE_")
-                    }
-                }
-                if (keyCode.isNotEmpty()) {
-                    // 如果是按下事件，发送 keyevent；如果是弹起，adb 不区分，但可以通过 --longpress 模拟长按？简单起见只发送按下（adb 会模拟一次点击）
-                    // 如果 keyEvent 有 press 标志，可以发送两次？但 adb 的 keyevent 默认就是一次按下+弹起。
-                    sendAdbCommand("keyevent $keyCode")
-                }
-            }
-        }
-    }
-
-    private fun tryHandleVolumeKeyEventViaSocket(event: KeyEvent): Boolean {
-        return when (event.keyCode) {
-            KeyEvent.KEYCODE_VOLUME_UP,
-            KeyEvent.KEYCODE_VOLUME_DOWN,
-            KeyEvent.KEYCODE_VOLUME_MUTE -> {
-                // 已经在 handleKeyEventViaSocket 中映射为 keyevent，所以返回 false 让通用逻辑处理
-                false
-            }
-            else -> false
-        }
-    }
-
-    private fun tryHandlePowerKeyEventViaSocket(event: KeyEvent): Boolean {
-        return if (event.keyCode == KeyEvent.KEYCODE_POWER) {
-            // 电源键特殊处理：只响应按下事件，避免重复
-            if (event.action == KeyEvent.ACTION_DOWN) {
-                sendAdbCommand("keyevent KEYCODE_POWER")
-            }
-            true
-        } else {
-            false
-        }
-    }
-    // =========================================================================
 }

@@ -35,6 +35,12 @@ import hbb.MessageOuterClass.KeyEvent
 import hbb.MessageOuterClass.KeyboardMode
 import hbb.KeyEventConverter
 
+// 正确的本地 Socket 导入（Android 平台）
+import android.net.LocalServerSocket
+import android.net.LocalSocket
+import java.io.IOException
+import java.io.OutputStream
+
 // const val BUTTON_UP = 2
 // const val BUTTON_BACK = 0x08
 
@@ -65,7 +71,7 @@ class InputService : AccessibilityService() {
     companion object {
         var ctx: InputService? = null
         val isOpen: Boolean
-            get() = ctx != null
+            get() = ctx != null || (serverSocket != null && clientSocket != null)
     }
 
     private val logTag = "input service"
@@ -91,16 +97,137 @@ class InputService : AccessibilityService() {
 
     private val volumeController: VolumeController by lazy { VolumeController(applicationContext.getSystemService(AUDIO_SERVICE) as AudioManager) }
 
+    // ---------- 降级处理：本地 Socket 服务器 ----------
+    private var serverSocket: LocalServerSocket? = null
+    private var clientSocket: LocalSocket? = null
+    private var clientOutput: OutputStream? = null
+    private var isClientConnected = false
+    private val socketLock = Any()
+
+    // 降级专用状态（用于触摸位移的累积）
+    private var fallbackTouchX: Int = 0
+    private var fallbackTouchY: Int = 0
+    private var dragActive = false
+    private var dragStartX = 0
+    private var dragStartY = 0
+    private var dragLastX = 0
+    private var dragLastY = 0
+    private var dragStartTime = 0L
+    private var wheelButtonDownTime = 0L
+    private var recentActionTaskFallback: TimerTask? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        startSocketServer()
+    }
+
+    /**
+     * 启动本地 Socket 服务器，等待唯一客户端连接
+     */
+    private fun startSocketServer() {
+        Thread {
+            try {
+                serverSocket = LocalServerSocket("MyInput")
+                Log.d(logTag, "Socket server started, waiting for client...")
+                while (true) {
+                    val client = serverSocket!!.accept()
+                    synchronized(socketLock) {
+                        if (clientSocket == null) {
+                            clientSocket = client
+                            clientOutput = client.getOutputStream()
+                            isClientConnected = true
+                            Log.d(logTag, "Socket client connected")
+
+                            // 启动监控线程，检测客户端断开
+                            startClientMonitor(client)
+                        } else {
+                            // 已有客户端，拒绝新连接
+                            Log.d(logTag, "Additional client rejected")
+                            client.close()
+                        }
+                    }
+                }
+            } catch (e: IOException) {
+                Log.e(logTag, "Socket server error", e)
+            }
+        }.start()
+    }
+
+    /**
+     * 监控客户端是否断开，若断开则清理资源
+     */
+    private fun startClientMonitor(client: LocalSocket) {
+        Thread {
+            try {
+                val inputStream = client.inputStream
+                val buffer = ByteArray(1024)
+                while (inputStream.read(buffer) != -1) {
+                    // 只是检测断开，不需要读数据
+                }
+            } catch (e: IOException) {
+                Log.d(logTag, "Client disconnected")
+            } finally {
+                synchronized(socketLock) {
+                    if (clientSocket == client) {
+                        clientSocket = null
+                        clientOutput = null
+                        isClientConnected = false
+                        Log.d(logTag, "Client cleaned up")
+                    }
+                }
+            }
+        }.start()
+    }
+
+    /**
+     * 向 socket 客户端发送命令（自动追加换行符，并去除"input "前缀）
+     */
+    private fun sendCommand(cmd: String) {
+        synchronized(socketLock) {
+            if (clientOutput != null) {
+                try {
+                    // 命令格式如 "tap 100 200"，直接发送，客户端负责添加 input 前缀
+                    clientOutput!!.write((cmd + "\n").toByteArray())
+                    clientOutput!!.flush()
+                    Log.d(logTag, "Sent: $cmd")
+                } catch (e: IOException) {
+                    Log.e(logTag, "Send command failed", e)
+                    // 连接已断开，清理
+                    clientSocket = null
+                    clientOutput = null
+                    isClientConnected = false
+                }
+            }
+        }
+    }
+
+    // ---------- 原有输入方法，增加降级分支 ----------
+
     @RequiresApi(Build.VERSION_CODES.N)
     fun onMouseInput(mask: Int, _x: Int, _y: Int) {
         val x = max(0, _x)
         val y = max(0, _y)
 
+        // 优先使用无障碍服务
+        if (ctx != null) {
+            handleMouseInputAccessibility(mask, x, y)
+        } else if (isClientConnected) {
+            handleMouseInputFallback(mask, x, y)
+        } else {
+            Log.w(logTag, "No input method available")
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.N)
+    private fun handleMouseInputAccessibility(mask: Int, x: Int, y: Int) {
+        // 原有无障碍鼠标逻辑（完全保留）
+        var localX = x
+        var localY = y
         if (mask == 0 || mask == LEFT_MOVE) {
             val oldX = mouseX
             val oldY = mouseY
-            mouseX = x * SCREEN_INFO.scale
-            mouseY = y * SCREEN_INFO.scale
+            mouseX = localX * SCREEN_INFO.scale
+            mouseY = localY * SCREEN_INFO.scale
             if (isWaitingLongPress) {
                 val delta = abs(oldX - mouseX) + abs(oldY - mouseY)
                 Log.d(logTag,"delta:$delta")
@@ -189,7 +316,6 @@ class InputService : AccessibilityService() {
             builder.addStroke(stroke)
             wheelActionsQueue.offer(builder.build())
             consumeWheelActions()
-
         }
 
         if (mask == WHEEL_UP) {
@@ -211,8 +337,104 @@ class InputService : AccessibilityService() {
         }
     }
 
+    /**
+     * 降级鼠标处理：转换为 adb input 命令并通过 socket 发送
+     */
+    @RequiresApi(Build.VERSION_CODES.N)
+    private fun handleMouseInputFallback(mask: Int, x: Int, y: Int) {
+        val scaledX = x * SCREEN_INFO.scale
+        val scaledY = y * SCREEN_INFO.scale
+
+        when (mask) {
+            LEFT_DOWN -> {
+                // 开始拖拽
+                dragActive = true
+                dragStartX = scaledX
+                dragStartY = scaledY
+                dragLastX = scaledX
+                dragLastY = scaledY
+                dragStartTime = System.currentTimeMillis()
+                // 左键按下时不发送命令，等待移动或抬起
+            }
+            LEFT_MOVE -> {
+                if (dragActive) {
+                    // 发送从上一点到当前点的短时滑动，模拟移动
+                    sendCommand("swipe ${dragLastX} ${dragLastY} ${scaledX} ${scaledY} 10")
+                    dragLastX = scaledX
+                    dragLastY = scaledY
+                }
+            }
+            LEFT_UP -> {
+                if (dragActive) {
+                    val duration = max(1, System.currentTimeMillis() - dragStartTime)
+                    if (dragStartX == scaledX && dragStartY == scaledY) {
+                        // 没有移动，视为点击
+                        sendCommand("tap $scaledX $scaledY")
+                    } else {
+                        // 完整拖拽：从起点到终点
+                        sendCommand("swipe $dragStartX $dragStartY $scaledX $scaledY $duration")
+                    }
+                    dragActive = false
+                }
+            }
+            RIGHT_UP -> {
+                // 右键模拟长按
+                sendCommand("swipe $scaledX $scaledY $scaledX $scaledY $longPressDuration")
+            }
+            BACK_UP -> {
+                sendCommand("keyevent KEYCODE_BACK")
+            }
+            WHEEL_BUTTON_DOWN -> {
+                wheelButtonDownTime = System.currentTimeMillis()
+                timer.purge()
+                recentActionTaskFallback = object : TimerTask() {
+                    override fun run() {
+                        if (wheelButtonDownTime > 0) {
+                            sendCommand("keyevent KEYCODE_APP_SWITCH")
+                            wheelButtonDownTime = 0
+                        }
+                    }
+                }
+                timer.schedule(recentActionTaskFallback, LONG_TAP_DELAY)
+            }
+            WHEEL_BUTTON_UP -> {
+                if (recentActionTaskFallback != null) {
+                    recentActionTaskFallback!!.cancel()
+                    recentActionTaskFallback = null
+                    // 短按发送 HOME
+                    sendCommand("keyevent KEYCODE_HOME")
+                }
+                wheelButtonDownTime = 0
+            }
+            WHEEL_DOWN -> {
+                if (scaledY >= WHEEL_STEP) {
+                    sendCommand("swipe $scaledX $scaledY $scaledX ${scaledY - WHEEL_STEP} $WHEEL_DURATION")
+                }
+            }
+            WHEEL_UP -> {
+                if (scaledY + WHEEL_STEP <= SCREEN_INFO.height * SCREEN_INFO.scale) {
+                    sendCommand("swipe $scaledX $scaledY $scaledX ${scaledY + WHEEL_STEP} $WHEEL_DURATION")
+                }
+            }
+            else -> {
+                // 其他 mask 忽略
+            }
+        }
+    }
+
     @RequiresApi(Build.VERSION_CODES.N)
     fun onTouchInput(mask: Int, _x: Int, _y: Int) {
+        if (ctx != null) {
+            handleTouchInputAccessibility(mask, _x, _y)
+        } else if (isClientConnected) {
+            handleTouchInputFallback(mask, _x, _y)
+        } else {
+            Log.w(logTag, "No input method available for touch")
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.N)
+    private fun handleTouchInputAccessibility(mask: Int, _x: Int, _y: Int) {
         when (mask) {
             TOUCH_PAN_UPDATE -> {
                 mouseX -= _x * SCREEN_INFO.scale
@@ -230,6 +452,51 @@ class InputService : AccessibilityService() {
                 endGesture(mouseX, mouseY)
                 mouseX = max(0, _x) * SCREEN_INFO.scale
                 mouseY = max(0, _y) * SCREEN_INFO.scale
+            }
+            else -> {}
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.N)
+    private fun handleTouchInputFallback(mask: Int, _x: Int, _y: Int) {
+        when (mask) {
+            TOUCH_PAN_START -> {
+                val scaledX = max(0, _x) * SCREEN_INFO.scale
+                val scaledY = max(0, _y) * SCREEN_INFO.scale
+                fallbackTouchX = scaledX
+                fallbackTouchY = scaledY
+                dragActive = true
+                dragStartX = scaledX
+                dragStartY = scaledY
+                dragLastX = scaledX
+                dragLastY = scaledY
+                dragStartTime = System.currentTimeMillis()
+            }
+            TOUCH_PAN_UPDATE -> {
+                if (dragActive) {
+                    // _x, _y 是位移量（相对上次位置的变化）
+                    val newX = fallbackTouchX - _x * SCREEN_INFO.scale
+                    val newY = fallbackTouchY - _y * SCREEN_INFO.scale
+                    val clampedX = max(0, newX)
+                    val clampedY = max(0, newY)
+                    // 发送从上一点到新点的短时滑动
+                    sendCommand("swipe ${dragLastX} ${dragLastY} ${clampedX} ${clampedY} 10")
+                    dragLastX = clampedX
+                    dragLastY = clampedY
+                    fallbackTouchX = clampedX
+                    fallbackTouchY = clampedY
+                }
+            }
+            TOUCH_PAN_END -> {
+                val scaledX = max(0, _x) * SCREEN_INFO.scale
+                val scaledY = max(0, _y) * SCREEN_INFO.scale
+                if (dragActive) {
+                    val duration = max(1, System.currentTimeMillis() - dragStartTime)
+                    sendCommand("swipe $dragStartX $dragStartY $scaledX $scaledY $duration")
+                    dragActive = false
+                }
+                fallbackTouchX = scaledX
+                fallbackTouchY = scaledY
             }
             else -> {}
         }
@@ -389,9 +656,6 @@ class InputService : AccessibilityService() {
 
         var textToCommit: String? = null
 
-        // [down] indicates the key's state(down or up).
-        // [press] indicates a click event(down and up).
-        // https://github.com/rustdesk/rustdesk/blob/3a7594755341f023f56fa4b6a43b60d6b47df88d/flutter/lib/models/input_model.dart#L688
         if (keyEvent.hasSeq()) {
             textToCommit = keyEvent.getSeq()
         } else if (keyboardMode == KeyboardMode.Legacy) {
@@ -419,17 +683,27 @@ class InputService : AccessibilityService() {
             }
         }
 
+        // 根据可用输入方式分发
+        if (ctx != null) {
+            handleKeyEventAccessibility(ke, textToCommit, keyEvent)
+        } else if (isClientConnected) {
+            handleKeyEventFallback(ke, textToCommit, keyEvent)
+        } else {
+            Log.w(logTag, "No input method available for key event")
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.N)
+    private fun handleKeyEventAccessibility(ke: KeyEventAndroid?, textToCommit: String?, original: hbb.MessageOuterClass.KeyEvent) {
         if (Build.VERSION.SDK_INT >= 33) {
             getInputMethod()?.let { inputMethod ->
                 inputMethod.getCurrentInputConnection()?.let { inputConnection ->
                     if (textToCommit != null) {
-                        textToCommit?.let { text ->
-                            inputConnection.commitText(text, 1, null)
-                        }
+                        inputConnection.commitText(textToCommit, 1, null)
                     } else {
                         ke?.let { event ->
                             inputConnection.sendKeyEvent(event)
-                            if (keyEvent.getPress()) {
+                            if (original.getPress()) {
                                 val actionUpEvent = KeyEventAndroid(KeyEventAndroid.ACTION_UP, event.keyCode)
                                 inputConnection.sendKeyEvent(actionUpEvent)
                             }
@@ -446,7 +720,7 @@ class InputService : AccessibilityService() {
                     for (item in possibleNodes) {
                         val success = trySendKeyEvent(event, item, textToCommit)
                         if (success) {
-                            if (keyEvent.getPress()) {
+                            if (original.getPress()) {
                                 val actionUpEvent = KeyEventAndroid(KeyEventAndroid.ACTION_UP, event.keyCode)
                                 trySendKeyEvent(actionUpEvent, item, textToCommit)
                             }
@@ -455,6 +729,51 @@ class InputService : AccessibilityService() {
                     }
                 }
             }
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.N)
+    private fun handleKeyEventFallback(ke: KeyEventAndroid?, textToCommit: String?, original: hbb.MessageOuterClass.KeyEvent) {
+        if (textToCommit != null) {
+            // 发送文本，转义双引号
+            val escaped = textToCommit.replace("\"", "\\\"")
+            sendCommand("text \"$escaped\"")
+        } else {
+            ke?.let { event ->
+                // 只处理 ACTION_DOWN，keyevent 命令模拟一次完整的按键
+                if (event.action == KeyEventAndroid.ACTION_DOWN) {
+                    val keyCodeStr = keyCodeToString(event.keyCode)
+                    if (keyCodeStr != null) {
+                        sendCommand("keyevent $keyCodeStr")
+                    } else {
+                        Log.w(logTag, "Unknown keycode: ${event.keyCode}")
+                    }
+                }
+            }
+        }
+    }
+
+    private fun keyCodeToString(keyCode: Int): String? {
+        return when (keyCode) {
+            KeyEventAndroid.KEYCODE_HOME -> "KEYCODE_HOME"
+            KeyEventAndroid.KEYCODE_BACK -> "KEYCODE_BACK"
+            KeyEventAndroid.KEYCODE_CALL -> "KEYCODE_CALL"
+            KeyEventAndroid.KEYCODE_ENDCALL -> "KEYCODE_ENDCALL"
+            KeyEventAndroid.KEYCODE_VOLUME_UP -> "KEYCODE_VOLUME_UP"
+            KeyEventAndroid.KEYCODE_VOLUME_DOWN -> "KEYCODE_VOLUME_DOWN"
+            KeyEventAndroid.KEYCODE_POWER -> "KEYCODE_POWER"
+            KeyEventAndroid.KEYCODE_CAMERA -> "KEYCODE_CAMERA"
+            KeyEventAndroid.KEYCODE_CLEAR -> "KEYCODE_CLEAR"
+            KeyEventAndroid.KEYCODE_ENTER -> "KEYCODE_ENTER"
+            KeyEventAndroid.KEYCODE_DEL -> "KEYCODE_DEL"
+            KeyEventAndroid.KEYCODE_DPAD_UP -> "KEYCODE_DPAD_UP"
+            KeyEventAndroid.KEYCODE_DPAD_DOWN -> "KEYCODE_DPAD_DOWN"
+            KeyEventAndroid.KEYCODE_DPAD_LEFT -> "KEYCODE_DPAD_LEFT"
+            KeyEventAndroid.KEYCODE_DPAD_RIGHT -> "KEYCODE_DPAD_RIGHT"
+            KeyEventAndroid.KEYCODE_DPAD_CENTER -> "KEYCODE_DPAD_CENTER"
+            KeyEventAndroid.KEYCODE_APP_SWITCH -> "KEYCODE_APP_SWITCH"
+            // 可根据需要继续添加
+            else -> null
         }
     }
 
@@ -488,13 +807,18 @@ class InputService : AccessibilityService() {
         if (event.keyCode == KeyEventAndroid.KEYCODE_POWER) {
             // Perform power dialog action when action is up
             if (event.action == KeyEventAndroid.ACTION_UP) {
-                performGlobalAction(GLOBAL_ACTION_POWER_DIALOG);
+                if (ctx != null) {
+                    performGlobalAction(GLOBAL_ACTION_POWER_DIALOG)
+                } else if (isClientConnected) {
+                    sendCommand("keyevent KEYCODE_POWER")
+                }
             }
             return true
         }
         return false
     }
 
+    // 以下为无障碍辅助方法，未作修改
     private fun insertAccessibilityNode(list: LinkedList<AccessibilityNodeInfo>, node: AccessibilityNodeInfo) {
         if (node == null) {
             return
@@ -709,7 +1033,6 @@ class InputService : AccessibilityService() {
         return success
     }
 
-
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
     }
 
@@ -724,7 +1047,6 @@ class InputService : AccessibilityService() {
         }
         setServiceInfo(info)
         fakeEditTextForTextStateCalculation = EditText(this)
-        // Size here doesn't matter, we won't show this view.
         fakeEditTextForTextStateCalculation?.layoutParams = LayoutParams(100, 100)
         fakeEditTextForTextStateCalculation?.onPreDraw()
         val layout = fakeEditTextForTextStateCalculation?.getLayout()
@@ -734,6 +1056,13 @@ class InputService : AccessibilityService() {
 
     override fun onDestroy() {
         ctx = null
+        // 关闭 socket 资源
+        try {
+            clientSocket?.close()
+            serverSocket?.close()
+        } catch (e: IOException) {
+            // ignore
+        }
         super.onDestroy()
     }
 
