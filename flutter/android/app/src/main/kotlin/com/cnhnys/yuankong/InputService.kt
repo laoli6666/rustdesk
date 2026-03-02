@@ -7,36 +7,33 @@ package com.cnhnys.yuankong
  */
 
 import android.accessibilityservice.AccessibilityService
-import android.accessibilityservice.AccessibilityServiceInfo
-import android.accessibilityservice.AccessibilityServiceInfo.FLAG_INPUT_METHOD_EDITOR
-import android.accessibilityservice.AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
 import android.accessibilityservice.GestureDescription
 import android.graphics.Path
-import android.graphics.Rect
-import android.media.AudioManager
-import android.net.LocalServerSocket
-import android.net.LocalSocket
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.widget.EditText
+import android.view.accessibility.AccessibilityEvent
+import android.view.ViewGroup.LayoutParams
+import android.view.accessibility.AccessibilityNodeInfo
 import android.view.KeyEvent as KeyEventAndroid
 import android.view.ViewConfiguration
-import android.view.accessibility.AccessibilityEvent
-import android.view.accessibility.AccessibilityNodeInfo
+import android.graphics.Rect
+import android.media.AudioManager
+import android.accessibilityservice.AccessibilityServiceInfo
+import android.accessibilityservice.AccessibilityServiceInfo.FLAG_INPUT_METHOD_EDITOR
+import android.accessibilityservice.AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
 import android.view.inputmethod.EditorInfo
-import android.widget.EditText
-import android.view.ViewGroup.LayoutParams
 import androidx.annotation.RequiresApi
-import hbb.KeyEventConverter
-import hbb.MessageOuterClass.KeyEvent
-import hbb.MessageOuterClass.KeyboardMode
-import java.io.OutputStream
-import java.lang.Character
 import java.util.*
+import java.lang.Character
 import kotlin.math.abs
 import kotlin.math.max
+import hbb.MessageOuterClass.KeyEvent
+import hbb.MessageOuterClass.KeyboardMode
+import hbb.KeyEventConverter
 
 // const val BUTTON_UP = 2
 // const val BUTTON_BACK = 0x08
@@ -94,27 +91,11 @@ class InputService : AccessibilityService() {
 
     private val volumeController: VolumeController by lazy { VolumeController(applicationContext.getSystemService(AUDIO_SERVICE) as AudioManager) }
 
-    // ========== LocalSocket 降级相关 ==========
-    private var localServerSocket: LocalServerSocket? = null
-    private var clientSocket: LocalSocket? = null
-    private var outputStream: OutputStream? = null
-    @Volatile
-    private var isFallbackConnected = false
-    private var serverThread: Thread? = null
-    // ========================================
-
     @RequiresApi(Build.VERSION_CODES.N)
     fun onMouseInput(mask: Int, _x: Int, _y: Int) {
         val x = max(0, _x)
         val y = max(0, _y)
 
-        if (isFallbackConnected) {
-            // 降级模式：转换为 adb 命令并发送
-            handleMouseInputFallback(mask, x, y)
-            return
-        }
-
-        // 原有的无障碍手势处理
         if (mask == 0 || mask == LEFT_MOVE) {
             val oldX = mouseX
             val oldY = mouseY
@@ -232,11 +213,6 @@ class InputService : AccessibilityService() {
 
     @RequiresApi(Build.VERSION_CODES.N)
     fun onTouchInput(mask: Int, _x: Int, _y: Int) {
-        if (isFallbackConnected) {
-            handleTouchInputFallback(mask, _x, _y)
-            return
-        }
-
         when (mask) {
             TOUCH_PAN_UPDATE -> {
                 mouseX -= _x * SCREEN_INFO.scale
@@ -258,255 +234,6 @@ class InputService : AccessibilityService() {
             else -> {}
         }
     }
-
-    @RequiresApi(Build.VERSION_CODES.N)
-    fun onKeyEvent(data: ByteArray) {
-        val keyEvent = KeyEvent.parseFrom(data)
-        val keyboardMode = keyEvent.getMode()
-
-        var textToCommit: String? = null
-
-        if (keyEvent.hasSeq()) {
-            textToCommit = keyEvent.getSeq()
-        } else if (keyboardMode == KeyboardMode.Legacy) {
-            if (keyEvent.hasChr() && (keyEvent.getDown() || keyEvent.getPress())) {
-                val chr = keyEvent.getChr()
-                if (chr != null) {
-                    textToCommit = String(Character.toChars(chr))
-                }
-            }
-        } else if (keyboardMode == KeyboardMode.Translate) {
-        } else {
-        }
-
-        Log.d(logTag, "onKeyEvent $keyEvent textToCommit:$textToCommit")
-
-        if (isFallbackConnected) {
-            handleKeyEventFallback(keyEvent, textToCommit)
-            return
-        }
-
-        var ke: KeyEventAndroid? = null
-        if (Build.VERSION.SDK_INT < 33 || textToCommit == null) {
-            ke = KeyEventConverter.toAndroidKeyEvent(keyEvent)
-        }
-        ke?.let { event ->
-            if (tryHandleVolumeKeyEvent(event)) {
-                return
-            } else if (tryHandlePowerKeyEvent(event)) {
-                return
-            }
-        }
-
-        if (Build.VERSION.SDK_INT >= 33) {
-            getInputMethod()?.let { inputMethod ->
-                inputMethod.getCurrentInputConnection()?.let { inputConnection ->
-                    if (textToCommit != null) {
-                        textToCommit?.let { text ->
-                            inputConnection.commitText(text, 1, null)
-                        }
-                    } else {
-                        ke?.let { event ->
-                            inputConnection.sendKeyEvent(event)
-                            if (keyEvent.getPress()) {
-                                val actionUpEvent = KeyEventAndroid(KeyEventAndroid.ACTION_UP, event.keyCode)
-                                inputConnection.sendKeyEvent(actionUpEvent)
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            val handler = Handler(Looper.getMainLooper())
-            handler.post {
-                ke?.let { event ->
-                    val possibleNodes = possibleAccessibiltyNodes()
-                    Log.d(logTag, "possibleNodes:$possibleNodes")
-                    for (item in possibleNodes) {
-                        val success = trySendKeyEvent(event, item, textToCommit)
-                        if (success) {
-                            if (keyEvent.getPress()) {
-                                val actionUpEvent = KeyEventAndroid(KeyEventAndroid.ACTION_UP, event.keyCode)
-                                trySendKeyEvent(actionUpEvent, item, textToCommit)
-                            }
-                            break
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // ========== 降级处理函数 ==========
-    @RequiresApi(Build.VERSION_CODES.N)
-    private fun handleMouseInputFallback(mask: Int, x: Int, y: Int) {
-        val scaledX = x * SCREEN_INFO.scale
-        val scaledY = y * SCREEN_INFO.scale
-
-        when (mask) {
-            LEFT_DOWN -> {
-                // 记录起始点，准备可能的拖动
-                lastX = scaledX
-                lastY = scaledY
-                // 先发送一个 tap? 但按下不立即发送，等移动或抬起
-            }
-            LEFT_MOVE -> {
-                // 发送从上次位置到当前位置的直线滑动（模拟移动）
-                val cmd = "swipe $lastX $lastY $scaledX $scaledY 0"
-                sendAdbCommand(cmd)
-                lastX = scaledX
-                lastY = scaledY
-            }
-            LEFT_UP -> {
-                // 如果与起始点相同，发送 tap，否则最后一次移动已经覆盖
-                if (lastX == scaledX && lastY == scaledY) {
-                    val cmd = "tap $scaledX $scaledY"
-                    sendAdbCommand(cmd)
-                }
-            }
-            RIGHT_UP -> {
-                // 长按：发送带 duration 的 swipe
-                val cmd = "swipe $scaledX $scaledY $scaledX $scaledY 500"
-                sendAdbCommand(cmd)
-            }
-            BACK_UP -> {
-                sendAdbCommand("keyevent BACK")
-            }
-            WHEEL_BUTTON_DOWN -> {
-                // 模拟中键按下 -> 忽略或发送 HOME? 这里不处理
-            }
-            WHEEL_BUTTON_UP -> {
-                // 中键抬起，可能之前有按下，但这里简化，不做处理
-            }
-            WHEEL_DOWN -> {
-                // 模拟滚轮向下，用方向键代替
-                sendAdbCommand("keyevent DPAD_DOWN")
-            }
-            WHEEL_UP -> {
-                sendAdbCommand("keyevent DPAD_UP")
-            }
-        }
-    }
-
-    private fun handleTouchInputFallback(mask: Int, dx: Int, dy: Int) {
-        // 触摸板平移：转换为相对滑动
-        when (mask) {
-            TOUCH_PAN_START -> {
-                // 忽略起始
-            }
-            TOUCH_PAN_UPDATE -> {
-                val newX = mouseX - dx * SCREEN_INFO.scale
-                val newY = mouseY - dy * SCREEN_INFO.scale
-                val scaledX = newX.coerceAtLeast(0)
-                val scaledY = newY.coerceAtLeast(0)
-                val cmd = "swipe $mouseX $mouseY $scaledX $scaledY 0"
-                sendAdbCommand(cmd)
-                mouseX = scaledX
-                mouseY = scaledY
-            }
-            TOUCH_PAN_END -> {
-                // 结束无需发送额外命令
-            }
-        }
-    }
-
-    private fun handleKeyEventFallback(keyEvent: KeyEvent, textToCommit: String?) {
-        if (textToCommit != null) {
-            // 发送 text 命令，注意文本中可能有空格等，简单处理
-            val cmd = "text $textToCommit"
-            sendAdbCommand(cmd)
-        } else {
-            val ke = KeyEventConverter.toAndroidKeyEvent(keyEvent)
-            ke?.let {
-                if (keyEvent.getPress()) {
-                    // 按下和抬起两个事件
-                    sendAdbCommand("keyevent ${it.keyCode}")
-                    sendAdbCommand("keyevent ${it.keyCode}") // 抬起时再发一次? adb keyevent 实际上是按下+抬起，所以一次就够了
-                } else if (keyEvent.getDown()) {
-                    sendAdbCommand("keyevent ${it.keyCode}")
-                }
-            }
-        }
-    }
-
-    private fun sendAdbCommand(cmd: String) {
-        if (!isFallbackConnected || outputStream == null) {
-            return
-        }
-        try {
-            // 添加换行符
-            val data = (cmd + "\n").toByteArray(Charsets.UTF_8)
-            outputStream!!.write(data)
-            outputStream!!.flush()
-            Log.d(logTag, "Adb fallback sent: $cmd")
-        } catch (e: Exception) {
-            Log.e(logTag, "Failed to send adb command: $e")
-            // 可能连接断开，重置标志
-            closeFallbackConnection()
-        }
-    }
-
-    // ========== LocalSocket 服务器 ==========
-    private fun startLocalSocketServer() {
-        serverThread = Thread {
-            try {
-                localServerSocket = LocalServerSocket("myinput")  // 抽象命名空间
-                Log.d(logTag, "LocalSocket server started on myinput")
-                while (!Thread.currentThread().isInterrupted) {
-                    try {
-                        val socket = localServerSocket!!.accept()
-                        Log.d(logTag, "Client connected: $socket")
-                        // 只接受一个客户端，断开后再接受新的
-                        synchronized(this@InputService) {
-                            clientSocket?.close()
-                            clientSocket = socket
-                            outputStream = socket.outputStream
-                            isFallbackConnected = true
-                        }
-                        // 等待客户端断开
-                        val input = socket.inputStream
-                        val buf = ByteArray(1024)
-                        while (socket.isConnected && input.read(buf) != -1) {
-                            // 读取数据，但不处理，仅用于检测断开
-                        }
-                    } catch (e: Exception) {
-                        Log.e(logTag, "Socket accept error: $e")
-                    } finally {
-                        closeFallbackConnection()
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e(logTag, "Failed to start local socket server: $e")
-            }
-        }
-        serverThread?.start()
-    }
-
-    private fun closeFallbackConnection() {
-        synchronized(this) {
-            try {
-                outputStream?.close()
-                clientSocket?.close()
-            } catch (e: Exception) {
-                // ignore
-            }
-            outputStream = null
-            clientSocket = null
-            isFallbackConnected = false
-        }
-    }
-
-    private fun stopLocalSocketServer() {
-        serverThread?.interrupt()
-        try {
-            localServerSocket?.close()
-        } catch (e: Exception) {
-            // ignore
-        }
-        closeFallbackConnection()
-    }
-
-    // ========== 原有的私有方法保持不变 ==========
 
     @RequiresApi(Build.VERSION_CODES.N)
     private fun consumeWheelActions() {
@@ -655,6 +382,82 @@ class InputService : AccessibilityService() {
         }
     }
 
+    @RequiresApi(Build.VERSION_CODES.N)
+    fun onKeyEvent(data: ByteArray) {
+        val keyEvent = KeyEvent.parseFrom(data)
+        val keyboardMode = keyEvent.getMode()
+
+        var textToCommit: String? = null
+
+        // [down] indicates the key's state(down or up).
+        // [press] indicates a click event(down and up).
+        // https://github.com/rustdesk/rustdesk/blob/3a7594755341f023f56fa4b6a43b60d6b47df88d/flutter/lib/models/input_model.dart#L688
+        if (keyEvent.hasSeq()) {
+            textToCommit = keyEvent.getSeq()
+        } else if (keyboardMode == KeyboardMode.Legacy) {
+            if (keyEvent.hasChr() && (keyEvent.getDown() || keyEvent.getPress())) {
+                val chr = keyEvent.getChr()
+                if (chr != null) {
+                    textToCommit = String(Character.toChars(chr))
+                }
+            }
+        } else if (keyboardMode == KeyboardMode.Translate) {
+        } else {
+        }
+
+        Log.d(logTag, "onKeyEvent $keyEvent textToCommit:$textToCommit")
+
+        var ke: KeyEventAndroid? = null
+        if (Build.VERSION.SDK_INT < 33 || textToCommit == null) {
+            ke = KeyEventConverter.toAndroidKeyEvent(keyEvent)
+        }
+        ke?.let { event ->
+            if (tryHandleVolumeKeyEvent(event)) {
+                return
+            } else if (tryHandlePowerKeyEvent(event)) {
+                return
+            }
+        }
+
+        if (Build.VERSION.SDK_INT >= 33) {
+            getInputMethod()?.let { inputMethod ->
+                inputMethod.getCurrentInputConnection()?.let { inputConnection ->
+                    if (textToCommit != null) {
+                        textToCommit?.let { text ->
+                            inputConnection.commitText(text, 1, null)
+                        }
+                    } else {
+                        ke?.let { event ->
+                            inputConnection.sendKeyEvent(event)
+                            if (keyEvent.getPress()) {
+                                val actionUpEvent = KeyEventAndroid(KeyEventAndroid.ACTION_UP, event.keyCode)
+                                inputConnection.sendKeyEvent(actionUpEvent)
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            val handler = Handler(Looper.getMainLooper())
+            handler.post {
+                ke?.let { event ->
+                    val possibleNodes = possibleAccessibiltyNodes()
+                    Log.d(logTag, "possibleNodes:$possibleNodes")
+                    for (item in possibleNodes) {
+                        val success = trySendKeyEvent(event, item, textToCommit)
+                        if (success) {
+                            if (keyEvent.getPress()) {
+                                val actionUpEvent = KeyEventAndroid(KeyEventAndroid.ACTION_UP, event.keyCode)
+                                trySendKeyEvent(actionUpEvent, item, textToCommit)
+                            }
+                            break
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     private fun tryHandleVolumeKeyEvent(event: KeyEventAndroid): Boolean {
         when (event.keyCode) {
             KeyEventAndroid.KEYCODE_VOLUME_UP -> {
@@ -683,6 +486,7 @@ class InputService : AccessibilityService() {
 
     private fun tryHandlePowerKeyEvent(event: KeyEventAndroid): Boolean {
         if (event.keyCode == KeyEventAndroid.KEYCODE_POWER) {
+            // Perform power dialog action when action is up
             if (event.action == KeyEventAndroid.ACTION_UP) {
                 performGlobalAction(GLOBAL_ACTION_POWER_DIALOG);
             }
@@ -847,6 +651,7 @@ class InputService : AccessibilityService() {
             }
 
             this.fakeEditTextForTextStateCalculation?.let {
+                // This is essiential to make sure layout object is created. OnKeyDown may not work if layout is not created.
                 val rect = Rect()
                 node.getBoundsInScreen(rect)
 
@@ -904,6 +709,7 @@ class InputService : AccessibilityService() {
         return success
     }
 
+
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
     }
 
@@ -918,18 +724,15 @@ class InputService : AccessibilityService() {
         }
         setServiceInfo(info)
         fakeEditTextForTextStateCalculation = EditText(this)
+        // Size here doesn't matter, we won't show this view.
         fakeEditTextForTextStateCalculation?.layoutParams = LayoutParams(100, 100)
         fakeEditTextForTextStateCalculation?.onPreDraw()
         val layout = fakeEditTextForTextStateCalculation?.getLayout()
         Log.d(logTag, "fakeEditTextForTextStateCalculation layout:$layout")
         Log.d(logTag, "onServiceConnected!")
-
-        // 启动 LocalSocket 服务器
-        startLocalSocketServer()
     }
 
     override fun onDestroy() {
-        stopLocalSocketServer()
         ctx = null
         super.onDestroy()
     }
