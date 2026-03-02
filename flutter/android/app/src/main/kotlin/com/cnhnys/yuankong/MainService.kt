@@ -32,6 +32,7 @@ import android.util.Log
 import android.view.Surface
 import android.view.Surface.FRAME_RATE_COMPATIBILITY_DEFAULT
 import android.view.WindowManager
+import android.view.KeyEvent // 修正：添加 KeyEvent 导入
 import androidx.annotation.Keep
 import androidx.annotation.RequiresApi
 import androidx.core.app.ActivityCompat
@@ -47,8 +48,8 @@ import kotlin.math.max
 import kotlin.math.min
 // ==================== 新增导入 ====================
 import java.io.*
-import java.net.LocalServerSocket
-import java.net.LocalSocket
+import android.net.LocalServerSocket  // 修正：使用 android.net 包
+import android.net.LocalSocket        // 修正：使用 android.net 包
 import java.util.*
 // =================================================
 
@@ -978,23 +979,23 @@ class MainService : Service() {
                     return
                 }
                 val keyCode = when (event.keyCode) {
-                    KeyEventAndroid.KEYCODE_DEL -> "KEYCODE_DEL"
-                    KeyEventAndroid.KEYCODE_ENTER -> "KEYCODE_ENTER"
-                    KeyEventAndroid.KEYCODE_HOME -> "KEYCODE_HOME"
-                    KeyEventAndroid.KEYCODE_BACK -> "KEYCODE_BACK"
-                    KeyEventAndroid.KEYCODE_MENU -> "KEYCODE_MENU"
-                    KeyEventAndroid.KEYCODE_VOLUME_UP -> "KEYCODE_VOLUME_UP"
-                    KeyEventAndroid.KEYCODE_VOLUME_DOWN -> "KEYCODE_VOLUME_DOWN"
-                    KeyEventAndroid.KEYCODE_VOLUME_MUTE -> "KEYCODE_VOLUME_MUTE"
-                    KeyEventAndroid.KEYCODE_POWER -> "KEYCODE_POWER"
-                    KeyEventAndroid.KEYCODE_DPAD_UP -> "KEYCODE_DPAD_UP"
-                    KeyEventAndroid.KEYCODE_DPAD_DOWN -> "KEYCODE_DPAD_DOWN"
-                    KeyEventAndroid.KEYCODE_DPAD_LEFT -> "KEYCODE_DPAD_LEFT"
-                    KeyEventAndroid.KEYCODE_DPAD_RIGHT -> "KEYCODE_DPAD_RIGHT"
-                    KeyEventAndroid.KEYCODE_DPAD_CENTER -> "KEYCODE_DPAD_CENTER"
+                    KeyEvent.KEYCODE_DEL -> "KEYCODE_DEL"
+                    KeyEvent.KEYCODE_ENTER -> "KEYCODE_ENTER"
+                    KeyEvent.KEYCODE_HOME -> "KEYCODE_HOME"
+                    KeyEvent.KEYCODE_BACK -> "KEYCODE_BACK"
+                    KeyEvent.KEYCODE_MENU -> "KEYCODE_MENU"
+                    KeyEvent.KEYCODE_VOLUME_UP -> "KEYCODE_VOLUME_UP"
+                    KeyEvent.KEYCODE_VOLUME_DOWN -> "KEYCODE_VOLUME_DOWN"
+                    KeyEvent.KEYCODE_VOLUME_MUTE -> "KEYCODE_VOLUME_MUTE"
+                    KeyEvent.KEYCODE_POWER -> "KEYCODE_POWER"
+                    KeyEvent.KEYCODE_DPAD_UP -> "KEYCODE_DPAD_UP"
+                    KeyEvent.KEYCODE_DPAD_DOWN -> "KEYCODE_DPAD_DOWN"
+                    KeyEvent.KEYCODE_DPAD_LEFT -> "KEYCODE_DPAD_LEFT"
+                    KeyEvent.KEYCODE_DPAD_RIGHT -> "KEYCODE_DPAD_RIGHT"
+                    KeyEvent.KEYCODE_DPAD_CENTER -> "KEYCODE_DPAD_CENTER"
                     else -> {
                         // 对于其他按键，尝试获取名称
-                        KeyEventAndroid.keyCodeToString(event.keyCode).removePrefix("KEYCODE_")
+                        KeyEvent.keyCodeToString(event.keyCode).removePrefix("KEYCODE_")
                     }
                 }
                 if (keyCode.isNotEmpty()) {
@@ -1006,11 +1007,11 @@ class MainService : Service() {
         }
     }
 
-    private fun tryHandleVolumeKeyEventViaSocket(event: KeyEventAndroid): Boolean {
+    private fun tryHandleVolumeKeyEventViaSocket(event: KeyEvent): Boolean {
         return when (event.keyCode) {
-            KeyEventAndroid.KEYCODE_VOLUME_UP,
-            KeyEventAndroid.KEYCODE_VOLUME_DOWN,
-            KeyEventAndroid.KEYCODE_VOLUME_MUTE -> {
+            KeyEvent.KEYCODE_VOLUME_UP,
+            KeyEvent.KEYCODE_VOLUME_DOWN,
+            KeyEvent.KEYCODE_VOLUME_MUTE -> {
                 // 已经在 handleKeyEventViaSocket 中映射为 keyevent，所以返回 false 让通用逻辑处理
                 false
             }
@@ -1018,10 +1019,10 @@ class MainService : Service() {
         }
     }
 
-    private fun tryHandlePowerKeyEventViaSocket(event: KeyEventAndroid): Boolean {
-        return if (event.keyCode == KeyEventAndroid.KEYCODE_POWER) {
+    private fun tryHandlePowerKeyEventViaSocket(event: KeyEvent): Boolean {
+        return if (event.keyCode == KeyEvent.KEYCODE_POWER) {
             // 电源键特殊处理：只响应按下事件，避免重复
-            if (event.action == KeyEventAndroid.ACTION_DOWN) {
+            if (event.action == KeyEvent.ACTION_DOWN) {
                 sendAdbCommand("keyevent KEYCODE_POWER")
             }
             true
