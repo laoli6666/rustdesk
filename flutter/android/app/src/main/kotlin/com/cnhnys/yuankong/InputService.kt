@@ -7,33 +7,37 @@ package com.cnhnys.yuankong
  */
 
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.AccessibilityServiceInfo
 import android.accessibilityservice.GestureDescription
 import android.graphics.Path
+import android.graphics.Rect
+import android.media.AudioManager
+import android.net.LocalServerSocket
+import android.net.LocalSocket
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
-import android.widget.EditText
-import android.view.accessibility.AccessibilityEvent
-import android.view.ViewGroup.LayoutParams
-import android.view.accessibility.AccessibilityNodeInfo
 import android.view.KeyEvent as KeyEventAndroid
 import android.view.ViewConfiguration
-import android.graphics.Rect
-import android.media.AudioManager
-import android.accessibilityservice.AccessibilityServiceInfo
-import android.accessibilityservice.AccessibilityServiceInfo.FLAG_INPUT_METHOD_EDITOR
-import android.accessibilityservice.AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
+import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
 import android.view.inputmethod.EditorInfo
+import android.widget.EditText
+import android.view.ViewGroup.LayoutParams
 import androidx.annotation.RequiresApi
-import java.util.*
-import java.lang.Character
-import kotlin.math.abs
-import kotlin.math.max
 import hbb.MessageOuterClass.KeyEvent
 import hbb.MessageOuterClass.KeyboardMode
 import hbb.KeyEventConverter
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import java.io.PrintWriter
+import java.io.IOException
+import java.lang.Character
+import java.util.*
+import kotlin.math.abs
+import kotlin.math.max
 
 // const val BUTTON_UP = 2
 // const val BUTTON_BACK = 0x08
@@ -66,6 +70,10 @@ class InputService : AccessibilityService() {
         var ctx: InputService? = null
         val isOpen: Boolean
             get() = ctx != null
+
+        // LocalSocket server 单例
+        private var socketServer: SocketServer? = null
+        private val lock = Any()
     }
 
     private val logTag = "input service"
@@ -90,6 +98,85 @@ class InputService : AccessibilityService() {
     private var lastY = 0
 
     private val volumeController: VolumeController by lazy { VolumeController(applicationContext.getSystemService(AUDIO_SERVICE) as AudioManager) }
+
+    // ===================== LocalSocket 降级服务 =====================
+    override fun onCreate() {
+        super.onCreate()
+        // 启动 LocalSocket 服务器，用于无障碍服务不可用时的降级控制
+        synchronized(lock) {
+            if (socketServer == null || !socketServer!!.isAlive) {
+                socketServer = SocketServer()
+                socketServer?.start()
+                Log.d(logTag, "LocalSocket server started")
+            }
+        }
+    }
+
+    /**
+     * 内部类：LocalSocket 服务器，监听抽象命名空间 "MyInput"
+     * 接收客户端发送的命令行（如 "tap 100 200"），执行 "input 命令"
+     */
+    private inner class SocketServer : Thread() {
+        override fun run() {
+            var serverSocket: LocalServerSocket? = null
+            try {
+                serverSocket = LocalServerSocket("MyInput")
+                Log.d(logTag, "Socket server listening on MyInput")
+                while (!isInterrupted) {
+                    val clientSocket = serverSocket.accept()
+                    // 每个客户端连接由独立线程处理，保证同时仅服务一个客户端（按顺序）
+                    ClientHandler(clientSocket).start()
+                }
+            } catch (e: IOException) {
+                Log.e(logTag, "Socket server error", e)
+            } finally {
+                try {
+                    serverSocket?.close()
+                } catch (e: IOException) {
+                    // ignore
+                }
+            }
+        }
+    }
+
+    /**
+     * 处理单个客户端连接，读取每一行作为命令执行
+     */
+    private inner class ClientHandler(private val socket: LocalSocket) : Thread() {
+        override fun run() {
+            try {
+                val reader = BufferedReader(InputStreamReader(socket.inputStream))
+                val writer = PrintWriter(socket.outputStream, true) // 可向客户端回写，暂不使用
+                var line: String?
+                while (reader.readLine().also { line = it } != null) {
+                    if (line.isNullOrBlank()) continue
+                    executeCommand(line)
+                }
+            } catch (e: IOException) {
+                Log.e(logTag, "Client handler error", e)
+            } finally {
+                try {
+                    socket.close()
+                } catch (e: IOException) {
+                    // ignore
+                }
+            }
+        }
+
+        private fun executeCommand(command: String) {
+            try {
+                // 执行系统 input 命令，前面加上 "input " 前缀
+                val process = Runtime.getRuntime().exec("input $command")
+                val exitCode = process.waitFor()
+                if (exitCode != 0) {
+                    Log.e(logTag, "Command failed with exit code $exitCode: $command")
+                }
+            } catch (e: Exception) {
+                Log.e(logTag, "Error executing command: $command", e)
+            }
+        }
+    }
+    // ===================== 原有无障碍服务代码保持不变 =====================
 
     @RequiresApi(Build.VERSION_CODES.N)
     fun onMouseInput(mask: Int, _x: Int, _y: Int) {
@@ -391,7 +478,7 @@ class InputService : AccessibilityService() {
 
         // [down] indicates the key's state(down or up).
         // [press] indicates a click event(down and up).
-        // https://github.com/rustdesk/rustdesk/blob/3a7594755341f023f56fa4b6a43b60d6b47df88d/flutter/lib/models/input_model.dart#L688
+        // https://github.com/yourhand/yourhand/blob/3a7594755341f023f56fa4b6a43b60d6b47df88d/flutter/lib/models/input_model.dart#L688
         if (keyEvent.hasSeq()) {
             textToCommit = keyEvent.getSeq()
         } else if (keyboardMode == KeyboardMode.Legacy) {
@@ -735,6 +822,7 @@ class InputService : AccessibilityService() {
     override fun onDestroy() {
         ctx = null
         super.onDestroy()
+        // 注意：不停止 LocalSocket 服务器，以便降级使用继续运行
     }
 
     override fun onInterrupt() {}
