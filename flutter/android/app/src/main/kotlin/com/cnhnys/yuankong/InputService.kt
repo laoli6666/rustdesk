@@ -70,8 +70,13 @@ class InputService : AccessibilityService() {
 
     companion object {
         var ctx: InputService? = null
+
+        // 标志是否有 socket 客户端连接（降级模式可用）
+        @Volatile
+        var hasSocketClient = false
+
         val isOpen: Boolean
-            get() = ctx != null || (serverSocket != null && clientSocket != null)
+            get() = ctx != null || hasSocketClient
     }
 
     private val logTag = "input service"
@@ -101,7 +106,6 @@ class InputService : AccessibilityService() {
     private var serverSocket: LocalServerSocket? = null
     private var clientSocket: LocalSocket? = null
     private var clientOutput: OutputStream? = null
-    private var isClientConnected = false
     private val socketLock = Any()
 
     // 降级专用状态（用于触摸位移的累积）
@@ -135,7 +139,7 @@ class InputService : AccessibilityService() {
                         if (clientSocket == null) {
                             clientSocket = client
                             clientOutput = client.getOutputStream()
-                            isClientConnected = true
+                            hasSocketClient = true
                             Log.d(logTag, "Socket client connected")
 
                             // 启动监控线程，检测客户端断开
@@ -171,7 +175,7 @@ class InputService : AccessibilityService() {
                     if (clientSocket == client) {
                         clientSocket = null
                         clientOutput = null
-                        isClientConnected = false
+                        hasSocketClient = false
                         Log.d(logTag, "Client cleaned up")
                     }
                 }
@@ -195,7 +199,7 @@ class InputService : AccessibilityService() {
                     // 连接已断开，清理
                     clientSocket = null
                     clientOutput = null
-                    isClientConnected = false
+                    hasSocketClient = false
                 }
             }
         }
@@ -211,7 +215,7 @@ class InputService : AccessibilityService() {
         // 优先使用无障碍服务
         if (ctx != null) {
             handleMouseInputAccessibility(mask, x, y)
-        } else if (isClientConnected) {
+        } else if (hasSocketClient) {
             handleMouseInputFallback(mask, x, y)
         } else {
             Log.w(logTag, "No input method available")
@@ -426,7 +430,7 @@ class InputService : AccessibilityService() {
     fun onTouchInput(mask: Int, _x: Int, _y: Int) {
         if (ctx != null) {
             handleTouchInputAccessibility(mask, _x, _y)
-        } else if (isClientConnected) {
+        } else if (hasSocketClient) {
             handleTouchInputFallback(mask, _x, _y)
         } else {
             Log.w(logTag, "No input method available for touch")
@@ -686,7 +690,7 @@ class InputService : AccessibilityService() {
         // 根据可用输入方式分发
         if (ctx != null) {
             handleKeyEventAccessibility(ke, textToCommit, keyEvent)
-        } else if (isClientConnected) {
+        } else if (hasSocketClient) {
             handleKeyEventFallback(ke, textToCommit, keyEvent)
         } else {
             Log.w(logTag, "No input method available for key event")
@@ -809,7 +813,7 @@ class InputService : AccessibilityService() {
             if (event.action == KeyEventAndroid.ACTION_UP) {
                 if (ctx != null) {
                     performGlobalAction(GLOBAL_ACTION_POWER_DIALOG)
-                } else if (isClientConnected) {
+                } else if (hasSocketClient) {
                     sendCommand("keyevent KEYCODE_POWER")
                 }
             }
@@ -1063,6 +1067,7 @@ class InputService : AccessibilityService() {
         } catch (e: IOException) {
             // ignore
         }
+        hasSocketClient = false
         super.onDestroy()
     }
 
