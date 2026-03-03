@@ -192,7 +192,7 @@ class InputService : AccessibilityService() {
                     dragLastX = scaledX
                     dragLastY = scaledY
                     dragStartTime = System.currentTimeMillis()
-                    Log.d("input service", "handleTouchInputFallback START scaled=($scaledX,$scaledY)")
+                    Log.d("input service", "handleTouchInputFallback START mask=$mask _x=$_x _y=$_y scaled=($scaledX,$scaledY)")
                 }
                 TOUCH_PAN_UPDATE -> {
                     if (dragActive) {
@@ -205,7 +205,7 @@ class InputService : AccessibilityService() {
                         dragLastY = clampedY
                         fallbackTouchX = clampedX
                         fallbackTouchY = clampedY
-                        Log.d("input service", "handleTouchInputFallback UPDATE to ($clampedX,$clampedY)")
+                        Log.d("input service", "handleTouchInputFallback UPDATE mask=$mask to ($clampedX,$clampedY)")
                     }
                 }
                 TOUCH_PAN_END -> {
@@ -218,9 +218,11 @@ class InputService : AccessibilityService() {
                     }
                     fallbackTouchX = scaledX
                     fallbackTouchY = scaledY
-                    Log.d("input service", "handleTouchInputFallback END to ($scaledX,$scaledY)")
+                    Log.d("input service", "handleTouchInputFallback END mask=$mask to ($scaledX,$scaledY)")
                 }
-                else -> {}
+                else -> {
+                    Log.w("input service", "handleTouchInputFallback unknown mask=$mask")
+                }
             }
         }
 

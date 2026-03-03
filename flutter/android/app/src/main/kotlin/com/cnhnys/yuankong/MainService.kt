@@ -209,19 +209,8 @@ class MainService : Service() {
                 hasSocketClient = value != null
             }
 
-        // 限流参数：命令发送最小间隔（毫秒）
-        private const val COMMAND_COOLDOWN_MS = 1000L
-        private var lastCommandTime = 0L
-
-        @Synchronized
+        // 发送命令，无限流
         fun sendCommand(cmd: String) {
-            val now = System.currentTimeMillis()
-            if (now - lastCommandTime < COMMAND_COOLDOWN_MS) {
-                Log.d("MainService", "Command throttled: $cmd")
-                return
-            }
-            lastCommandTime = now
-
             socketOutput?.let {
                 try {
                     it.write((cmd + "\n").toByteArray())
