@@ -1,14 +1,5 @@
 package com.cnhnys.yuankong
 
-import ffi.FFI
-
-/**
- * Capture screen,get video and audio,send to rust.
- * Dispatch notifications
- *
- * Inspired by [droidVNC-NG] https://github.com/bk138/droidVNC-NG
- */
-
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.*
@@ -26,71 +17,98 @@ import android.hardware.display.VirtualDisplay
 import android.media.*
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
+import android.net.LocalServerSocket
+import android.net.LocalSocket
 import android.os.*
 import android.util.DisplayMetrics
 import android.util.Log
 import android.view.Surface
 import android.view.Surface.FRAME_RATE_COMPATIBILITY_DEFAULT
 import android.view.WindowManager
+import android.view.KeyEvent as KeyEventAndroid
 import androidx.annotation.Keep
 import androidx.annotation.RequiresApi
-import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import io.flutter.embedding.android.FlutterActivity
 import java.util.concurrent.Executors
-import kotlin.concurrent.thread
 import org.json.JSONException
 import org.json.JSONObject
-import java.nio.ByteBuffer
 import kotlin.math.max
 import kotlin.math.min
+import java.io.IOException
+import java.io.OutputStream
+import java.util.*
 
+// 常量（与原来保持一致）
 const val DEFAULT_NOTIFY_TITLE = "CloudBox"
 const val DEFAULT_NOTIFY_TEXT = "Service is running"
 const val DEFAULT_NOTIFY_ID = 1
 const val NOTIFY_ID_OFFSET = 100
-
 const val MIME_TYPE = MediaFormat.MIMETYPE_VIDEO_VP9
-
-// video const
-
 const val MAX_SCREEN_SIZE = 1200
-
 const val VIDEO_KEY_BIT_RATE = 1024_000
 const val VIDEO_KEY_FRAME_RATE = 30
+
+// 鼠标/触摸常量（与InputService一致）
+const val LEFT_DOWN = 9
+const val LEFT_MOVE = 8
+const val LEFT_UP = 10
+const val RIGHT_UP = 18
+const val BACK_UP = 66
+const val WHEEL_BUTTON_DOWN = 33
+const val WHEEL_BUTTON_UP = 34
+const val WHEEL_DOWN = 523331
+const val WHEEL_UP = 963
+const val TOUCH_PAN_START = 4
+const val TOUCH_PAN_UPDATE = 5
+const val TOUCH_PAN_END = 6
+const val WHEEL_STEP = 120
+const val WHEEL_DURATION = 50L
+const val LONG_TAP_DELAY = 200L
 
 class MainService : Service() {
 
     @Keep
     @RequiresApi(Build.VERSION_CODES.N)
     fun rustPointerInput(kind: Int, mask: Int, x: Int, y: Int) {
-        // turn on screen with LEFT_DOWN when screen off
+        // 亮屏逻辑
         if (!powerManager.isInteractive && (kind == 0 || mask == LEFT_DOWN)) {
             if (wakeLock.isHeld) {
                 Log.d(logTag, "Turn on Screen, WakeLock release")
                 wakeLock.release()
             }
-            Log.d(logTag,"Turn on Screen")
+            Log.d(logTag, "Turn on Screen")
             wakeLock.acquire(5000)
         } else {
             when (kind) {
                 0 -> { // touch
-                    InputService.ctx?.onTouchInput(mask, x, y)
+                    if (InputService.ctx != null) {
+                        InputService.ctx?.onTouchInput(mask, x, y)
+                    } else if (hasSocketClient) {
+                        InputService.handleTouchInputFallback(mask, x, y)
+                    }
                 }
                 1 -> { // mouse
-                    InputService.ctx?.onMouseInput(mask, x, y)
+                    if (InputService.ctx != null) {
+                        InputService.ctx?.onMouseInput(mask, x, y)
+                    } else if (hasSocketClient) {
+                        InputService.handleMouseInputFallback(mask, x, y)
+                    }
                 }
-                else -> {
-                }
+                else -> {}
             }
         }
     }
 
     @Keep
     @RequiresApi(Build.VERSION_CODES.N)
-    fun rustKeyEventInput(input: ByteArray) {
-        InputService.ctx?.onKeyEvent(input)
+    fun rustKeyEventInput(data: ByteArray) {
+        if (InputService.ctx != null) {
+            InputService.ctx?.onKeyEvent(data)
+        } else if (hasSocketClient) {
+            InputService.handleKeyEventFallback(data)
+        }
     }
 
     @Keep
@@ -98,9 +116,9 @@ class MainService : Service() {
         return when (name) {
             "screen_size" -> {
                 JSONObject().apply {
-                    put("width",SCREEN_INFO.width)
-                    put("height",SCREEN_INFO.height)
-                    put("scale",SCREEN_INFO.scale)
+                    put("width", SCREEN_INFO.width)
+                    put("height", SCREEN_INFO.height)
+                    put("scale", SCREEN_INFO.scale)
                 }.toString()
             }
             "is_start" -> {
@@ -181,10 +199,8 @@ class MainService : Service() {
                     isHalfScale = halfScale
                     updateScreenInfo(resources.configuration.orientation)
                 }
-
             }
-            else -> {
-            }
+            else -> {}
         }
     }
 
@@ -192,18 +208,38 @@ class MainService : Service() {
     private var serviceHandler: Handler? = null
 
     private val powerManager: PowerManager by lazy { applicationContext.getSystemService(Context.POWER_SERVICE) as PowerManager }
-    private val wakeLock: PowerManager.WakeLock by lazy { powerManager.newWakeLock(PowerManager.ACQUIRE_CAUSES_WAKEUP or PowerManager.SCREEN_BRIGHT_WAKE_LOCK, "rustdesk:wakelock")}
+    private val wakeLock: PowerManager.WakeLock by lazy { powerManager.newWakeLock(PowerManager.ACQUIRE_CAUSES_WAKEUP or PowerManager.SCREEN_BRIGHT_WAKE_LOCK, "rustdesk:wakelock") }
 
     companion object {
         private var _isReady = false // media permission ready status
         private var _isStart = false // screen capture start status
         private var _isAudioStart = false // audio capture start status
-        val isReady: Boolean
-            get() = _isReady
-        val isStart: Boolean
-            get() = _isStart
-        val isAudioStart: Boolean
-            get() = _isAudioStart
+        val isReady: Boolean get() = _isReady
+        val isStart: Boolean get() = _isStart
+        val isAudioStart: Boolean get() = _isAudioStart
+
+        // Socket 相关静态成员
+        @Volatile
+        var hasSocketClient = false
+            private set
+        private var socketOutput: OutputStream? = null
+            set(value) {
+                field = value
+                hasSocketClient = value != null
+            }
+
+        fun sendCommand(cmd: String) {
+            socketOutput?.let {
+                try {
+                    it.write((cmd + "\n").toByteArray())
+                    it.flush()
+                    Log.d("MainService", "Sent: $cmd")
+                } catch (e: IOException) {
+                    Log.e("MainService", "sendCommand failed", e)
+                    socketOutput = null
+                }
+            }
+        }
     }
 
     private val logTag = "LOG_SERVICE"
@@ -230,7 +266,7 @@ class MainService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        Log.d(logTag,"MainService onCreate, sdk int:${Build.VERSION.SDK_INT} reuseVirtualDisplay:$reuseVirtualDisplay")
+        Log.d(logTag, "MainService onCreate, sdk int:${Build.VERSION.SDK_INT} reuseVirtualDisplay:$reuseVirtualDisplay")
         FFI.init(this)
         HandlerThread("Service", Process.THREAD_PRIORITY_BACKGROUND).apply {
             start()
@@ -240,21 +276,32 @@ class MainService : Service() {
         updateScreenInfo(resources.configuration.orientation)
         initNotification()
 
-        // keep the config dir same with flutter
         val prefs = applicationContext.getSharedPreferences(KEY_SHARED_PREFERENCES, FlutterActivity.MODE_PRIVATE)
         val configPath = prefs.getString(KEY_APP_DIR_CONFIG_PATH, "") ?: ""
         FFI.startServer(configPath, "")
 
         createForegroundNotification()
+
+        // 启动 Socket 服务器
+        startSocketServer()
     }
 
     override fun onDestroy() {
         checkMediaPermission()
         stopService(Intent(this, FloatingWindowService::class.java))
+        // 关闭 socket
+        try {
+            clientSocket?.close()
+            serverSocket?.close()
+        } catch (e: IOException) {
+            // ignore
+        }
+        socketOutput = null
+        hasSocketClient = false
         super.onDestroy()
     }
 
-    private var isHalfScale: Boolean? = null;
+    private var isHalfScale: Boolean? = null
     private fun updateScreenInfo(orientation: Int) {
         var w: Int
         var h: Int
@@ -275,8 +322,8 @@ class MainService : Service() {
             dpi = dm.densityDpi
         }
 
-        val max = max(w,h)
-        val min = min(w,h)
+        val max = max(w, h)
+        val min = min(w, h)
         if (orientation == ORIENTATION_LANDSCAPE) {
             w = max
             h = min
@@ -284,7 +331,7 @@ class MainService : Service() {
             w = min
             h = max
         }
-        Log.d(logTag,"updateScreenInfo:w:$w,h:$h")
+        Log.d(logTag, "updateScreenInfo:w:$w,h:$h")
         var scale = 1
         if (w != 0 && h != 0) {
             if (isHalfScale == true && (w > MAX_SCREEN_SIZE || h > MAX_SCREEN_SIZE)) {
@@ -306,7 +353,6 @@ class MainService : Service() {
                     FFI.refreshScreen()
                 }
             }
-
         }
     }
 
@@ -332,7 +378,7 @@ class MainService : Service() {
             if (intent.getBooleanExtra(EXT_INIT_FROM_BOOT, false)) {
                 FFI.startService()
             }
-            Log.d(logTag, "service starting: ${startId}:${Thread.currentThread()}")
+            Log.d(logTag, "service starting: $startId:${Thread.currentThread()}")
             val mediaProjectionManager =
                 getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
 
@@ -346,7 +392,7 @@ class MainService : Service() {
                 requestMediaProjection()
             }
         }
-        return START_NOT_STICKY // don't use sticky (auto restart), the new service (from auto restart) will lose control
+        return START_NOT_STICKY
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
@@ -365,7 +411,6 @@ class MainService : Service() {
     @SuppressLint("WrongConstant")
     private fun createSurface(): Surface? {
         return if (useVP9) {
-            // TODO
             null
         } else {
             Log.d(logTag, "ImageReader.newInstance:INFO:$SCREEN_INFO")
@@ -378,7 +423,6 @@ class MainService : Service() {
                 ).apply {
                     setOnImageAvailableListener({ imageReader: ImageReader ->
                         try {
-                            // If not call acquireLatestImage, listener will not be called again
                             imageReader.acquireLatestImage().use { image ->
                                 if (image == null || !isStart) return@setOnImageAvailableListener
                                 val planes = image.planes
@@ -404,9 +448,7 @@ class MainService : Service() {
     }
 
     fun startCapture(): Boolean {
-        if (isStart) {
-            return true
-        }
+        if (isStart) return true
         if (mediaProjection == null) {
             Log.w(logTag, "startCapture fail,mediaProjection is null")
             return false
@@ -432,7 +474,7 @@ class MainService : Service() {
         }
         checkMediaPermission()
         _isStart = true
-        FFI.setFrameRawEnable("video",true)
+        FFI.setFrameRawEnable("video", true)
         MainActivity.rdClipboardManager?.setCaptureStarted(_isStart)
         return true
     }
@@ -440,20 +482,14 @@ class MainService : Service() {
     @Synchronized
     fun stopCapture() {
         Log.d(logTag, "Stop Capture")
-        FFI.setFrameRawEnable("video",false)
+        FFI.setFrameRawEnable("video", false)
         _isStart = false
         MainActivity.rdClipboardManager?.setCaptureStarted(_isStart)
-        // release video
         if (reuseVirtualDisplay) {
-            // The virtual display video projection can be paused by calling `setSurface(null)`.
-            // https://developer.android.com/reference/android/hardware/display/VirtualDisplay.Callback
-            // https://learn.microsoft.com/en-us/dotnet/api/android.hardware.display.virtualdisplay.callback.onpaused?view=net-android-34.0
             virtualDisplay?.setSurface(null)
         } else {
             virtualDisplay?.release()
         }
-        // suface needs to be release after `imageReader.close()` to imageReader access released surface
-        // https://github.com/rustdesk/rustdesk/issues/4118#issuecomment-1515666629
         imageReader?.close()
         imageReader = null
         videoEncoder?.let {
@@ -465,11 +501,8 @@ class MainService : Service() {
             virtualDisplay = null
         }
         videoEncoder = null
-        // suface needs to be release after `imageReader.close()` to imageReader access released surface
-        // https://github.com/rustdesk/rustdesk/issues/4118#issuecomment-1515666629
         surface?.release()
 
-        // release audio
         _isAudioStart = false
         audioRecordHandle.tryReleaseAudio()
     }
@@ -503,7 +536,7 @@ class MainService : Service() {
         Handler(Looper.getMainLooper()).post {
             MainActivity.flutterMethodChannel?.invokeMethod(
                 "on_state_changed",
-                mapOf("name" to "input", "value" to InputService.isOpen.toString())
+                mapOf("name" to "input", "value" to (InputService.isOpen || hasSocketClient).toString())
             )
         }
         return isReady
@@ -531,8 +564,6 @@ class MainService : Service() {
         }
     }
 
-    // https://github.com/bk138/droidVNC-NG/blob/b79af62db5a1c08ed94e6a91464859ffed6f4e97/app/src/main/java/net/christianbeier/droidvnc_ng/MediaProjectionService.java#L250
-    // Reuse virtualDisplay if it exists, to avoid media projection confirmation dialog every connection.
     private fun createOrSetVirtualDisplay(mp: MediaProjection, s: Surface) {
         try {
             virtualDisplay?.let {
@@ -546,8 +577,7 @@ class MainService : Service() {
                 )
             }
         } catch (e: SecurityException) {
-            Log.w(logTag, "createOrSetVirtualDisplay: got SecurityException, re-requesting confirmation");
-            // This initiates a prompt dialog for the user to confirm screen projection.
+            Log.w(logTag, "createOrSetVirtualDisplay: got SecurityException, re-requesting confirmation")
             requestMediaProjection()
         }
     }
@@ -579,8 +609,7 @@ class MainService : Service() {
     private fun createMediaCodec() {
         Log.d(logTag, "MediaFormat.MIMETYPE_VIDEO_VP9 :$MIME_TYPE")
         videoEncoder = MediaCodec.createEncoderByType(MIME_TYPE)
-        val mFormat =
-            MediaFormat.createVideoFormat(MIME_TYPE, SCREEN_INFO.width, SCREEN_INFO.height)
+        val mFormat = MediaFormat.createVideoFormat(MIME_TYPE, SCREEN_INFO.width, SCREEN_INFO.height)
         mFormat.setInteger(MediaFormat.KEY_BIT_RATE, VIDEO_KEY_BIT_RATE)
         mFormat.setInteger(MediaFormat.KEY_FRAME_RATE, VIDEO_KEY_FRAME_RATE)
         mFormat.setInteger(
@@ -645,30 +674,17 @@ class MainService : Service() {
         startForeground(DEFAULT_NOTIFY_ID, notification)
     }
 
-    private fun loginRequestNotification(
-        clientID: Int,
-        type: String,
-        username: String,
-        peerId: String
-    ) {
+    private fun loginRequestNotification(clientID: Int, type: String, username: String, peerId: String) {
         val notification = notificationBuilder
             .setOngoing(false)
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setContentTitle(translate("Do you accept?"))
             .setContentText("$type:$username-$peerId")
-            // .setStyle(MediaStyle().setShowActionsInCompactView(0, 1))
-            // .addAction(R.drawable.check_blue, "check", genLoginRequestPendingIntent(true))
-            // .addAction(R.drawable.close_red, "close", genLoginRequestPendingIntent(false))
             .build()
         notificationManager.notify(getClientNotifyID(clientID), notification)
     }
 
-    private fun onClientAuthorizedNotification(
-        clientID: Int,
-        type: String,
-        username: String,
-        peerId: String
-    ) {
+    private fun onClientAuthorizedNotification(clientID: Int, type: String, username: String, peerId: String) {
         cancelNotification(clientID)
         val notification = notificationBuilder
             .setOngoing(false)
@@ -679,12 +695,7 @@ class MainService : Service() {
         notificationManager.notify(getClientNotifyID(clientID), notification)
     }
 
-    private fun voiceCallRequestNotification(
-        clientID: Int,
-        type: String,
-        username: String,
-        peerId: String
-    ) {
+    private fun voiceCallRequestNotification(clientID: Int, type: String, username: String, peerId: String) {
         val notification = notificationBuilder
             .setOngoing(false)
             .setPriority(NotificationCompat.PRIORITY_MAX)
@@ -725,5 +736,62 @@ class MainService : Service() {
             .setContentText(text)
             .build()
         notificationManager.notify(DEFAULT_NOTIFY_ID, notification)
+    }
+
+    // ---------- Socket 服务器 ----------
+    private var serverSocket: LocalServerSocket? = null
+    private var clientSocket: LocalSocket? = null
+    private val socketLock = Any()
+
+    private fun startSocketServer() {
+        Thread {
+            try {
+                Log.i(logTag, "Creating LocalServerSocket...")
+                serverSocket = LocalServerSocket("MyInput")
+                Log.i(logTag, "Socket server started, waiting for client...")
+                while (true) {
+                    val client = serverSocket!!.accept()
+                    synchronized(socketLock) {
+                        if (clientSocket == null) {
+                            clientSocket = client
+                            socketOutput = client.getOutputStream()
+                            hasSocketClient = true
+                            Log.i(logTag, "Socket client connected")
+                            startClientMonitor(client)
+                            checkMediaPermission()
+                        } else {
+                            Log.i(logTag, "Additional client rejected")
+                            client.close()
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(logTag, "Socket server error", e)
+            }
+        }.start()
+    }
+
+    private fun startClientMonitor(client: LocalSocket) {
+        Thread {
+            try {
+                val inputStream = client.inputStream
+                val buffer = ByteArray(1024)
+                while (inputStream.read(buffer) != -1) {
+                    // 只检测断开
+                }
+            } catch (e: IOException) {
+                Log.d(logTag, "Client disconnected")
+            } finally {
+                synchronized(socketLock) {
+                    if (clientSocket == client) {
+                        clientSocket = null
+                        socketOutput = null
+                        hasSocketClient = false
+                        Log.d(logTag, "Client cleaned up")
+                        checkMediaPermission()
+                    }
+                }
+            }
+        }.start()
     }
 }
