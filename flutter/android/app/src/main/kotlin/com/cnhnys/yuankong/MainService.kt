@@ -40,7 +40,12 @@ import java.io.IOException
 import java.io.OutputStream
 import java.util.*
 
-// 常量（与原来保持一致）
+// 导入 FFI（关键）
+import ffi.FFI
+
+// 这些常量已在 InputService.kt 中定义，此处不再重复定义
+// 如果需要使用，可以直接引用（因为同包）
+
 const val DEFAULT_NOTIFY_TITLE = "CloudBox"
 const val DEFAULT_NOTIFY_TEXT = "Service is running"
 const val DEFAULT_NOTIFY_ID = 1
@@ -50,22 +55,7 @@ const val MAX_SCREEN_SIZE = 1200
 const val VIDEO_KEY_BIT_RATE = 1024_000
 const val VIDEO_KEY_FRAME_RATE = 30
 
-// 鼠标/触摸常量（与InputService一致）
-const val LEFT_DOWN = 9
-const val LEFT_MOVE = 8
-const val LEFT_UP = 10
-const val RIGHT_UP = 18
-const val BACK_UP = 66
-const val WHEEL_BUTTON_DOWN = 33
-const val WHEEL_BUTTON_UP = 34
-const val WHEEL_DOWN = 523331
-const val WHEEL_UP = 963
-const val TOUCH_PAN_START = 4
-const val TOUCH_PAN_UPDATE = 5
-const val TOUCH_PAN_END = 6
-const val WHEEL_STEP = 120
-const val WHEEL_DURATION = 50L
-const val LONG_TAP_DELAY = 200L
+// 注意：不再定义鼠标/触摸常量，因为它们已在 InputService 中定义
 
 class MainService : Service() {
 
