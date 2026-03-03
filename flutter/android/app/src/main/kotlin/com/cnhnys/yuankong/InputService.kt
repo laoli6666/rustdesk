@@ -1,11 +1,5 @@
 package com.cnhnys.yuankong
 
-/**
- * Handle remote input and dispatch android gesture
- *
- * Inspired by [droidVNC-NG] https://github.com/bk138/droidVNC-NG
- */
-
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.graphics.Path
@@ -25,7 +19,6 @@ import android.media.AudioManager
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.accessibilityservice.AccessibilityServiceInfo.FLAG_INPUT_METHOD_EDITOR
 import android.accessibilityservice.AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
-import android.view.inputmethod.EditorInfo
 import androidx.annotation.RequiresApi
 import java.util.*
 import java.lang.Character
@@ -35,14 +28,11 @@ import hbb.MessageOuterClass.KeyEvent
 import hbb.MessageOuterClass.KeyboardMode
 import hbb.KeyEventConverter
 
-// const val BUTTON_UP = 2
-// const val BUTTON_BACK = 0x08
-
+// 输入常量（保持唯一）
 const val LEFT_DOWN = 9
 const val LEFT_MOVE = 8
 const val LEFT_UP = 10
 const val RIGHT_UP = 18
-// (BUTTON_BACK << 3) | BUTTON_UP
 const val BACK_UP = 66
 const val WHEEL_BUTTON_DOWN = 33
 const val WHEEL_BUTTON_UP = 34
@@ -64,10 +54,12 @@ class InputService : AccessibilityService() {
 
     companion object {
         var ctx: InputService? = null
+
+        // isOpen 现在表示：无障碍服务已连接 或 socket 客户端已连接
         val isOpen: Boolean
             get() = ctx != null || MainService.hasSocketClient
 
-        // 降级处理方法（静态）
+        // ---------- 降级方法（静态）----------
         private var fallbackTouchX = 0
         private var fallbackTouchY = 0
         private var dragActive = false
@@ -83,8 +75,15 @@ class InputService : AccessibilityService() {
 
         @RequiresApi(Build.VERSION_CODES.N)
         fun handleMouseInputFallback(mask: Int, x: Int, y: Int) {
-            val scaledX = x * SCREEN_INFO.scale
-            val scaledY = y * SCREEN_INFO.scale
+            val scale = SCREEN_INFO.scale
+            if (scale <= 0) {
+                Log.e("input service", "SCREEN_INFO.scale = $scale, using 1 as fallback")
+            }
+            val safeScale = max(1, scale)
+            val scaledX = x * safeScale
+            val scaledY = y * safeScale
+            Log.d("input service", "handleMouseInputFallback mask=$mask x=$x y=$y scale=$scale scaled=($scaledX,$scaledY)")
+
             when (mask) {
                 LEFT_DOWN -> {
                     dragActive = true
@@ -154,10 +153,13 @@ class InputService : AccessibilityService() {
 
         @RequiresApi(Build.VERSION_CODES.N)
         fun handleTouchInputFallback(mask: Int, _x: Int, _y: Int) {
+            val scale = SCREEN_INFO.scale
+            val safeScale = max(1, scale)
+
             when (mask) {
                 TOUCH_PAN_START -> {
-                    val scaledX = max(0, _x) * SCREEN_INFO.scale
-                    val scaledY = max(0, _y) * SCREEN_INFO.scale
+                    val scaledX = max(0, _x) * safeScale
+                    val scaledY = max(0, _y) * safeScale
                     fallbackTouchX = scaledX
                     fallbackTouchY = scaledY
                     dragActive = true
@@ -166,11 +168,12 @@ class InputService : AccessibilityService() {
                     dragLastX = scaledX
                     dragLastY = scaledY
                     dragStartTime = System.currentTimeMillis()
+                    Log.d("input service", "handleTouchInputFallback START scaled=($scaledX,$scaledY)")
                 }
                 TOUCH_PAN_UPDATE -> {
                     if (dragActive) {
-                        val newX = fallbackTouchX - _x * SCREEN_INFO.scale
-                        val newY = fallbackTouchY - _y * SCREEN_INFO.scale
+                        val newX = fallbackTouchX - _x * safeScale
+                        val newY = fallbackTouchY - _y * safeScale
                         val clampedX = max(0, newX)
                         val clampedY = max(0, newY)
                         MainService.sendCommand("swipe ${dragLastX} ${dragLastY} ${clampedX} ${clampedY} 10")
@@ -178,11 +181,12 @@ class InputService : AccessibilityService() {
                         dragLastY = clampedY
                         fallbackTouchX = clampedX
                         fallbackTouchY = clampedY
+                        Log.d("input service", "handleTouchInputFallback UPDATE to ($clampedX,$clampedY)")
                     }
                 }
                 TOUCH_PAN_END -> {
-                    val scaledX = max(0, _x) * SCREEN_INFO.scale
-                    val scaledY = max(0, _y) * SCREEN_INFO.scale
+                    val scaledX = max(0, _x) * safeScale
+                    val scaledY = max(0, _y) * safeScale
                     if (dragActive) {
                         val duration = max(1, System.currentTimeMillis() - dragStartTime)
                         MainService.sendCommand("swipe $dragStartX $dragStartY $scaledX $scaledY $duration")
@@ -190,20 +194,19 @@ class InputService : AccessibilityService() {
                     }
                     fallbackTouchX = scaledX
                     fallbackTouchY = scaledY
+                    Log.d("input service", "handleTouchInputFallback END to ($scaledX,$scaledY)")
                 }
+                else -> {}
             }
         }
 
         @RequiresApi(Build.VERSION_CODES.N)
         fun handleKeyEventFallback(data: ByteArray) {
             val keyEvent = KeyEvent.parseFrom(data)
-            val keyboardMode = keyEvent.getMode()
-
             var textToCommit: String? = null
-
             if (keyEvent.hasSeq()) {
                 textToCommit = keyEvent.getSeq()
-            } else if (keyboardMode == KeyboardMode.Legacy) {
+            } else if (keyEvent.getMode() == KeyboardMode.Legacy) {
                 if (keyEvent.hasChr() && (keyEvent.getDown() || keyEvent.getPress())) {
                     val chr = keyEvent.getChr()
                     if (chr != null) {
@@ -211,7 +214,6 @@ class InputService : AccessibilityService() {
                     }
                 }
             }
-
             if (textToCommit != null) {
                 val escaped = textToCommit.replace("\"", "\\\"")
                 MainService.sendCommand("text \"$escaped\"")
@@ -222,6 +224,8 @@ class InputService : AccessibilityService() {
                         val keyCodeStr = keyCodeToString(event.keyCode)
                         if (keyCodeStr != null) {
                             MainService.sendCommand("keyevent $keyCodeStr")
+                        } else {
+                            Log.w("input service", "Unknown keycode: ${event.keyCode}")
                         }
                     }
                 }
@@ -252,6 +256,7 @@ class InputService : AccessibilityService() {
         }
     }
 
+    // ---------- 实例方法（原有无障碍手势逻辑，完全保留）----------
     private val logTag = "input service"
     private var leftIsDown = false
     private var touchPath = Path()
@@ -261,7 +266,6 @@ class InputService : AccessibilityService() {
     private var mouseY = 0
     private var timer = Timer()
     private var recentActionTask: TimerTask? = null
-    // 100(tap timeout) + 400(long press timeout)
     private val longPressDuration = ViewConfiguration.getTapTimeout().toLong() + ViewConfiguration.getLongPressTimeout().toLong()
 
     private val wheelActionsQueue = LinkedList<GestureDescription>()
@@ -275,7 +279,6 @@ class InputService : AccessibilityService() {
 
     private val volumeController: VolumeController by lazy { VolumeController(applicationContext.getSystemService(AUDIO_SERVICE) as AudioManager) }
 
-    // 原有的无障碍鼠标逻辑（完全保留）
     @RequiresApi(Build.VERSION_CODES.N)
     fun onMouseInput(mask: Int, _x: Int, _y: Int) {
         val x = max(0, _x)
@@ -288,14 +291,13 @@ class InputService : AccessibilityService() {
             mouseY = y * SCREEN_INFO.scale
             if (isWaitingLongPress) {
                 val delta = abs(oldX - mouseX) + abs(oldY - mouseY)
-                Log.d(logTag,"delta:$delta")
+                Log.d(logTag, "delta:$delta")
                 if (delta > 8) {
                     isWaitingLongPress = false
                 }
             }
         }
 
-        // left button down, was up
         if (mask == LEFT_DOWN) {
             isWaitingLongPress = true
             timer.schedule(object : TimerTask() {
@@ -312,12 +314,10 @@ class InputService : AccessibilityService() {
             return
         }
 
-        // left down, was down
         if (leftIsDown) {
             continueGesture(mouseX, mouseY)
         }
 
-        // left up, was down
         if (mask == LEFT_UP) {
             if (leftIsDown) {
                 leftIsDown = false
@@ -337,7 +337,6 @@ class InputService : AccessibilityService() {
             return
         }
 
-        // long WHEEL_BUTTON_DOWN -> GLOBAL_ACTION_RECENTS
         if (mask == WHEEL_BUTTON_DOWN) {
             timer.purge()
             recentActionTask = object : TimerTask() {
@@ -349,7 +348,6 @@ class InputService : AccessibilityService() {
             timer.schedule(recentActionTask, LONG_TAP_DELAY)
         }
 
-        // wheel button up
         if (mask == WHEEL_BUTTON_UP) {
             if (recentActionTask != null) {
                 recentActionTask!!.cancel()
@@ -359,36 +357,23 @@ class InputService : AccessibilityService() {
         }
 
         if (mask == WHEEL_DOWN) {
-            if (mouseY < WHEEL_STEP) {
-                return
-            }
+            if (mouseY < WHEEL_STEP) return
             val path = Path()
             path.moveTo(mouseX.toFloat(), mouseY.toFloat())
             path.lineTo(mouseX.toFloat(), (mouseY - WHEEL_STEP).toFloat())
-            val stroke = GestureDescription.StrokeDescription(
-                path,
-                0,
-                WHEEL_DURATION
-            )
+            val stroke = GestureDescription.StrokeDescription(path, 0, WHEEL_DURATION)
             val builder = GestureDescription.Builder()
             builder.addStroke(stroke)
             wheelActionsQueue.offer(builder.build())
             consumeWheelActions()
-
         }
 
         if (mask == WHEEL_UP) {
-            if (mouseY < WHEEL_STEP) {
-                return
-            }
+            if (mouseY < WHEEL_STEP) return
             val path = Path()
             path.moveTo(mouseX.toFloat(), mouseY.toFloat())
             path.lineTo(mouseX.toFloat(), (mouseY + WHEEL_STEP).toFloat())
-            val stroke = GestureDescription.StrokeDescription(
-                path,
-                0,
-                WHEEL_DURATION
-            )
+            val stroke = GestureDescription.StrokeDescription(path, 0, WHEEL_DURATION)
             val builder = GestureDescription.Builder()
             builder.addStroke(stroke)
             wheelActionsQueue.offer(builder.build())
@@ -402,8 +387,8 @@ class InputService : AccessibilityService() {
             TOUCH_PAN_UPDATE -> {
                 mouseX -= _x * SCREEN_INFO.scale
                 mouseY -= _y * SCREEN_INFO.scale
-                mouseX = max(0, mouseX);
-                mouseY = max(0, mouseY);
+                mouseX = max(0, mouseX)
+                mouseY = max(0, mouseY)
                 continueGesture(mouseX, mouseY)
             }
             TOUCH_PAN_START -> {
@@ -422,11 +407,8 @@ class InputService : AccessibilityService() {
 
     @RequiresApi(Build.VERSION_CODES.N)
     private fun consumeWheelActions() {
-        if (isWheelActionsPolling) {
-            return
-        } else {
-            isWheelActionsPolling = true
-        }
+        if (isWheelActionsPolling) return
+        isWheelActionsPolling = true
         wheelActionsQueue.poll()?.let {
             dispatchGesture(it, null, null)
             timer.purge()
@@ -478,35 +460,19 @@ class InputService : AccessibilityService() {
     private fun doDispatchGesture(x: Int, y: Int, willContinue: Boolean) {
         touchPath.lineTo(x.toFloat(), y.toFloat())
         var duration = System.currentTimeMillis() - lastTouchGestureStartTime
-        if (duration <= 0) {
-            duration = 1
-        }
+        if (duration <= 0) duration = 1
         try {
             if (stroke == null) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    stroke = GestureDescription.StrokeDescription(
-                        touchPath,
-                        0,
-                        duration,
-                        willContinue
-                    )
+                stroke = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    GestureDescription.StrokeDescription(touchPath, 0, duration, willContinue)
                 } else {
-                    stroke = GestureDescription.StrokeDescription(
-                        touchPath,
-                        0,
-                        duration
-                    )
+                    GestureDescription.StrokeDescription(touchPath, 0, duration)
                 }
             } else {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                     stroke = stroke?.continueStroke(touchPath, 0, duration, willContinue)
                 } else {
-                    stroke = null
-                    stroke = GestureDescription.StrokeDescription(
-                        touchPath,
-                        0,
-                        duration
-                    )
+                    stroke = GestureDescription.StrokeDescription(touchPath, 0, duration)
                 }
             }
             stroke?.let {
@@ -539,14 +505,8 @@ class InputService : AccessibilityService() {
         try {
             touchPath.lineTo(x.toFloat(), y.toFloat())
             var duration = System.currentTimeMillis() - lastTouchGestureStartTime
-            if (duration <= 0) {
-                duration = 1
-            }
-            val stroke = GestureDescription.StrokeDescription(
-                touchPath,
-                0,
-                duration
-            )
+            if (duration <= 0) duration = 1
+            val stroke = GestureDescription.StrokeDescription(touchPath, 0, duration)
             val builder = GestureDescription.Builder()
             builder.addStroke(stroke)
             Log.d(logTag, "end gesture x:$x y:$y time:$duration")
@@ -574,9 +534,6 @@ class InputService : AccessibilityService() {
 
         var textToCommit: String? = null
 
-        // [down] indicates the key's state(down or up).
-        // [press] indicates a click event(down and up).
-        // https://github.com/rustdesk/rustdesk/blob/3a7594755341f023f56fa4b6a43b60d6b47df88d/flutter/lib/models/input_model.dart#L688
         if (keyEvent.hasSeq()) {
             textToCommit = keyEvent.getSeq()
         } else if (keyboardMode == KeyboardMode.Legacy) {
@@ -608,9 +565,7 @@ class InputService : AccessibilityService() {
             getInputMethod()?.let { inputMethod ->
                 inputMethod.getCurrentInputConnection()?.let { inputConnection ->
                     if (textToCommit != null) {
-                        textToCommit?.let { text ->
-                            inputConnection.commitText(text, 1, null)
-                        }
+                        inputConnection.commitText(textToCommit, 1, null)
                     } else {
                         ke?.let { event ->
                             inputConnection.sendKeyEvent(event)
@@ -663,17 +618,14 @@ class InputService : AccessibilityService() {
                 }
                 return true
             }
-            else -> {
-                return false
-            }
+            else -> return false
         }
     }
 
     private fun tryHandlePowerKeyEvent(event: KeyEventAndroid): Boolean {
         if (event.keyCode == KeyEventAndroid.KEYCODE_POWER) {
-            // Perform power dialog action when action is up
             if (event.action == KeyEventAndroid.ACTION_UP) {
-                performGlobalAction(GLOBAL_ACTION_POWER_DIALOG);
+                performGlobalAction(GLOBAL_ACTION_POWER_DIALOG)
             }
             return true
         }
@@ -681,32 +633,20 @@ class InputService : AccessibilityService() {
     }
 
     private fun insertAccessibilityNode(list: LinkedList<AccessibilityNodeInfo>, node: AccessibilityNodeInfo) {
-        if (node == null) {
-            return
-        }
-        if (list.contains(node)) {
-            return
-        }
+        if (node == null) return
+        if (list.contains(node)) return
         list.add(node)
     }
 
     private fun findChildNode(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
-        if (node == null) {
-            return null
-        }
-        if (node.isEditable() && node.isFocusable()) {
-            return node
-        }
+        if (node == null) return null
+        if (node.isEditable() && node.isFocusable()) return node
         val childCount = node.getChildCount()
         for (i in 0 until childCount) {
             val child = node.getChild(i)
             if (child != null) {
-                if (child.isEditable() && child.isFocusable()) {
-                    return child
-                }
-                if (Build.VERSION.SDK_INT < 33) {
-                    child.recycle()
-                }
+                if (child.isEditable() && child.isFocusable()) return child
+                if (Build.VERSION.SDK_INT < 33) child.recycle()
             }
         }
         for (i in 0 until childCount) {
@@ -714,13 +654,9 @@ class InputService : AccessibilityService() {
             if (child != null) {
                 val result = findChildNode(child)
                 if (Build.VERSION.SDK_INT < 33) {
-                    if (child != result) {
-                        child.recycle()
-                    }
+                    if (child != result) child.recycle()
                 }
-                if (result != null) {
-                    return result
-                }
+                if (result != null) return result
             }
         }
         return null
@@ -755,7 +691,6 @@ class InputService : AccessibilityService() {
 
         val childFromFocusInput = findChildNode(focusInput)
         Log.d(logTag, "childFromFocusInput:$childFromFocusInput")
-
         if (childFromFocusInput != null) {
             insertAccessibilityNode(linkedList, childFromFocusInput)
         }
@@ -779,7 +714,7 @@ class InputService : AccessibilityService() {
 
     private fun trySendKeyEvent(event: KeyEventAndroid, node: AccessibilityNodeInfo, textToCommit: String?): Boolean {
         node.refresh()
-        this.fakeEditTextForTextStateCalculation?.setSelection(0,0)
+        this.fakeEditTextForTextStateCalculation?.setSelection(0, 0)
         this.fakeEditTextForTextStateCalculation?.setText(null)
 
         val text = node.getText()
@@ -792,15 +727,9 @@ class InputService : AccessibilityService() {
         var textSelectionEnd = node.textSelectionEnd
 
         if (text != null) {
-            if (textSelectionStart > text.length) {
-                textSelectionStart = text.length
-            }
-            if (textSelectionEnd > text.length) {
-                textSelectionEnd = text.length
-            }
-            if (textSelectionStart > textSelectionEnd) {
-                textSelectionStart = textSelectionEnd
-            }
+            if (textSelectionStart > text.length) textSelectionStart = text.length
+            if (textSelectionEnd > text.length) textSelectionEnd = text.length
+            if (textSelectionStart > textSelectionEnd) textSelectionStart = textSelectionEnd
         }
 
         var success = false
@@ -814,10 +743,7 @@ class InputService : AccessibilityService() {
                 success = updateTextForAccessibilityNode(node)
             } else if (text != null) {
                 this.fakeEditTextForTextStateCalculation?.setText(text)
-                this.fakeEditTextForTextStateCalculation?.setSelection(
-                    textSelectionStart,
-                    textSelectionEnd
-                )
+                this.fakeEditTextForTextStateCalculation?.setSelection(textSelectionStart, textSelectionEnd)
                 this.fakeEditTextForTextStateCalculation?.text?.insert(textSelectionStart, textToCommit)
                 success = updateTextAndSelectionForAccessibiltyNode(node)
             }
@@ -829,17 +755,12 @@ class InputService : AccessibilityService() {
             }
             if (textSelectionStart != -1 && textSelectionEnd != -1) {
                 Log.d(logTag, "setting selection $textSelectionStart $textSelectionEnd")
-                this.fakeEditTextForTextStateCalculation?.setSelection(
-                    textSelectionStart,
-                    textSelectionEnd
-                )
+                this.fakeEditTextForTextStateCalculation?.setSelection(textSelectionStart, textSelectionEnd)
             }
 
             this.fakeEditTextForTextStateCalculation?.let {
-                // This is essiential to make sure layout object is created. OnKeyDown may not work if layout is not created.
                 val rect = Rect()
                 node.getBoundsInScreen(rect)
-
                 it.layout(rect.left, rect.top, rect.right, rect.bottom)
                 it.onPreDraw()
                 if (event.action == KeyEventAndroid.ACTION_DOWN) {
@@ -848,7 +769,7 @@ class InputService : AccessibilityService() {
                 } else if (event.action == KeyEventAndroid.ACTION_UP) {
                     val success = it.onKeyUp(event.getKeyCode(), event)
                     Log.d(logTag, "keyup $success")
-                } else {}
+                }
             }
 
             success = updateTextAndSelectionForAccessibiltyNode(node)
@@ -860,10 +781,7 @@ class InputService : AccessibilityService() {
         var success = false
         this.fakeEditTextForTextStateCalculation?.text?.let {
             val arguments = Bundle()
-            arguments.putCharSequence(
-                AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
-                it.toString()
-            )
+            arguments.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, it.toString())
             success = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments)
         }
         return success
@@ -878,14 +796,8 @@ class InputService : AccessibilityService() {
 
             if (selectionStart != null && selectionEnd != null) {
                 val arguments = Bundle()
-                arguments.putInt(
-                    AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT,
-                    selectionStart
-                )
-                arguments.putInt(
-                    AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT,
-                    selectionEnd
-                )
+                arguments.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, selectionStart)
+                arguments.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, selectionEnd)
                 success = node.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, arguments)
                 Log.d(logTag, "Update selection to $selectionStart $selectionEnd success:$success")
             }
@@ -894,9 +806,7 @@ class InputService : AccessibilityService() {
         return success
     }
 
-
-    override fun onAccessibilityEvent(event: AccessibilityEvent) {
-    }
+    override fun onAccessibilityEvent(event: AccessibilityEvent) {}
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -909,7 +819,6 @@ class InputService : AccessibilityService() {
         }
         setServiceInfo(info)
         fakeEditTextForTextStateCalculation = EditText(this)
-        // Size here doesn't matter, we won't show this view.
         fakeEditTextForTextStateCalculation?.layoutParams = LayoutParams(100, 100)
         fakeEditTextForTextStateCalculation?.onPreDraw()
         val layout = fakeEditTextForTextStateCalculation?.getLayout()
