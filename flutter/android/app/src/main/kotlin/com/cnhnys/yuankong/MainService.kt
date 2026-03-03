@@ -54,7 +54,6 @@ class MainService : Service() {
     @Keep
     @RequiresApi(Build.VERSION_CODES.N)
     fun rustPointerInput(kind: Int, mask: Int, x: Int, y: Int) {
-        // 亮屏逻辑（保持不变）
         if (!powerManager.isInteractive && (kind == 0 || mask == LEFT_DOWN)) {
             if (wakeLock.isHeld) {
                 Log.d(logTag, "Turn on Screen, WakeLock release")
@@ -210,7 +209,19 @@ class MainService : Service() {
                 hasSocketClient = value != null
             }
 
+        // 限流参数：命令发送最小间隔（毫秒）
+        private const val COMMAND_COOLDOWN_MS = 1000L
+        private var lastCommandTime = 0L
+
+        @Synchronized
         fun sendCommand(cmd: String) {
+            val now = System.currentTimeMillis()
+            if (now - lastCommandTime < COMMAND_COOLDOWN_MS) {
+                Log.d("MainService", "Command throttled: $cmd")
+                return
+            }
+            lastCommandTime = now
+
             socketOutput?.let {
                 try {
                     it.write((cmd + "\n").toByteArray())
@@ -260,13 +271,12 @@ class MainService : Service() {
         FFI.startServer(configPath, "")
 
         createForegroundNotification()
-        startSocketServer()  // 启动 socket 服务器
+        startSocketServer()
     }
 
     override fun onDestroy() {
         checkMediaPermission()
         stopService(Intent(this, FloatingWindowService::class.java))
-        // 关闭 socket
         try {
             clientSocket?.close()
             serverSocket?.close()
@@ -732,7 +742,7 @@ class MainService : Service() {
                             hasSocketClient = true
                             Log.i(logTag, "Socket client connected")
                             startClientMonitor(client)
-                            checkMediaPermission() // 更新输入状态
+                            checkMediaPermission()
                         } else {
                             Log.i(logTag, "Additional client rejected")
                             client.close()

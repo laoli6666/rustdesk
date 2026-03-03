@@ -28,7 +28,7 @@ import hbb.MessageOuterClass.KeyEvent
 import hbb.MessageOuterClass.KeyboardMode
 import hbb.KeyEventConverter
 
-// 输入常量（保持唯一）
+// 输入常量（与 MainService 共享）
 const val LEFT_DOWN = 9
 const val LEFT_MOVE = 8
 const val LEFT_UP = 10
@@ -55,7 +55,6 @@ class InputService : AccessibilityService() {
     companion object {
         var ctx: InputService? = null
 
-        // isOpen 现在表示：无障碍服务已连接 或 socket 客户端已连接
         val isOpen: Boolean
             get() = ctx != null || MainService.hasSocketClient
 
@@ -73,6 +72,12 @@ class InputService : AccessibilityService() {
         private val timer = Timer()
         private val longPressDuration = ViewConfiguration.getTapTimeout().toLong() + ViewConfiguration.getLongPressTimeout().toLong()
 
+        // 最近一次有效的鼠标坐标（用于修复坐标为0的问题）
+        @Volatile
+        private var lastValidMouseX = 0
+        @Volatile
+        private var lastValidMouseY = 0
+
         @RequiresApi(Build.VERSION_CODES.N)
         fun handleMouseInputFallback(mask: Int, x: Int, y: Int) {
             val scale = SCREEN_INFO.scale
@@ -84,35 +89,54 @@ class InputService : AccessibilityService() {
             val scaledY = y * safeScale
             Log.d("input service", "handleMouseInputFallback mask=$mask x=$x y=$y scale=$scale scaled=($scaledX,$scaledY)")
 
+            // 更新最近有效坐标
+            if ((mask == 0 || mask == LEFT_MOVE) && scaledX > 0 && scaledY > 0) {
+                lastValidMouseX = scaledX
+                lastValidMouseY = scaledY
+            }
+
+            // 如果坐标为0且存在有效坐标，则使用上次有效坐标
+            val useX = if (scaledX == 0 && scaledY == 0 && lastValidMouseX > 0 && lastValidMouseY > 0) {
+                Log.d("input service", "Using last valid position ($lastValidMouseX,$lastValidMouseY) for mask=$mask")
+                lastValidMouseX
+            } else {
+                scaledX
+            }
+            val useY = if (scaledX == 0 && scaledY == 0 && lastValidMouseY > 0) {
+                lastValidMouseY
+            } else {
+                scaledY
+            }
+
             when (mask) {
                 LEFT_DOWN -> {
                     dragActive = true
-                    dragStartX = scaledX
-                    dragStartY = scaledY
-                    dragLastX = scaledX
-                    dragLastY = scaledY
+                    dragStartX = useX
+                    dragStartY = useY
+                    dragLastX = useX
+                    dragLastY = useY
                     dragStartTime = System.currentTimeMillis()
                 }
                 LEFT_MOVE -> {
                     if (dragActive) {
-                        MainService.sendCommand("swipe ${dragLastX} ${dragLastY} ${scaledX} ${scaledY} 10")
-                        dragLastX = scaledX
-                        dragLastY = scaledY
+                        MainService.sendCommand("swipe ${dragLastX} ${dragLastY} ${useX} ${useY} 10")
+                        dragLastX = useX
+                        dragLastY = useY
                     }
                 }
                 LEFT_UP -> {
                     if (dragActive) {
                         val duration = max(1, System.currentTimeMillis() - dragStartTime)
-                        if (dragStartX == scaledX && dragStartY == scaledY) {
-                            MainService.sendCommand("tap $scaledX $scaledY")
+                        if (dragStartX == useX && dragStartY == useY) {
+                            MainService.sendCommand("tap $useX $useY")
                         } else {
-                            MainService.sendCommand("swipe $dragStartX $dragStartY $scaledX $scaledY $duration")
+                            MainService.sendCommand("swipe $dragStartX $dragStartY $useX $useY $duration")
                         }
                         dragActive = false
                     }
                 }
                 RIGHT_UP -> {
-                    MainService.sendCommand("swipe $scaledX $scaledY $scaledX $scaledY $longPressDuration")
+                    MainService.sendCommand("swipe $useX $useY $useX $useY $longPressDuration")
                 }
                 BACK_UP -> {
                     MainService.sendCommand("keyevent KEYCODE_BACK")
@@ -139,13 +163,13 @@ class InputService : AccessibilityService() {
                     wheelButtonDownTime = 0
                 }
                 WHEEL_DOWN -> {
-                    if (scaledY >= WHEEL_STEP) {
-                        MainService.sendCommand("swipe $scaledX $scaledY $scaledX ${scaledY - WHEEL_STEP} $WHEEL_DURATION")
+                    if (useY >= WHEEL_STEP) {
+                        MainService.sendCommand("swipe $useX $useY $useX ${useY - WHEEL_STEP} $WHEEL_DURATION")
                     }
                 }
                 WHEEL_UP -> {
-                    if (scaledY + WHEEL_STEP <= SCREEN_INFO.height * SCREEN_INFO.scale) {
-                        MainService.sendCommand("swipe $scaledX $scaledY $scaledX ${scaledY + WHEEL_STEP} $WHEEL_DURATION")
+                    if (useY + WHEEL_STEP <= SCREEN_INFO.height * SCREEN_INFO.scale) {
+                        MainService.sendCommand("swipe $useX $useY $useX ${useY + WHEEL_STEP} $WHEEL_DURATION")
                     }
                 }
             }
